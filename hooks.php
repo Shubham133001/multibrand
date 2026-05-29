@@ -2157,5 +2157,147 @@ function multibrand_save_ticket_brand($vars) {
     }
 }
 
+/**
+ * Hook to dynamically override product/service pricing based on brand
+ */
+add_hook('OrderProductPricingOverride', 1, function ($vars) {
+    $brand = get_multibrand_active_brand();
+    if (!$brand || !$brand->price_override) {
+        return;
+    }
+
+    try {
+        $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+        $pid = $vars['pid'];
+        $productOverrides = $pricingOverrides['products'][$pid]['pricing'] ?? [];
+        
+        if (!empty($productOverrides)) {
+            $currencyId = (int)($_SESSION['currency'] ?? 1);
+            $rates = $productOverrides[$currencyId] ?? [];
+            if (!empty($rates)) {
+                $cycle = strtolower($vars['proddata']['billingcycle'] ?? '');
+                
+                if ($cycle == 'monthly' && isset($rates['monthly']) && $rates['monthly'] !== '') {
+                    return [
+                        'setup' => $rates['msetupfee'] !== '' ? $rates['msetupfee'] : '0.00',
+                        'recurring' => $rates['monthly']
+                    ];
+                } elseif ($cycle == 'quarterly' && isset($rates['quarterly']) && $rates['quarterly'] !== '') {
+                    return [
+                        'setup' => $rates['qsetupfee'] !== '' ? $rates['qsetupfee'] : '0.00',
+                        'recurring' => $rates['quarterly']
+                    ];
+                } elseif ($cycle == 'semiannually' && isset($rates['semiannually']) && $rates['semiannually'] !== '') {
+                    return [
+                        'setup' => $rates['ssetupfee'] !== '' ? $rates['ssetupfee'] : '0.00',
+                        'recurring' => $rates['semiannually']
+                    ];
+                } elseif ($cycle == 'annually' && isset($rates['annually']) && $rates['annually'] !== '') {
+                    return [
+                        'setup' => $rates['asetupfee'] !== '' ? $rates['asetupfee'] : '0.00',
+                        'recurring' => $rates['annually']
+                    ];
+                } elseif ($cycle == 'biennially' && isset($rates['biennially']) && $rates['biennially'] !== '') {
+                    return [
+                        'setup' => $rates['bsetupfee'] !== '' ? $rates['bsetupfee'] : '0.00',
+                        'recurring' => $rates['biennially']
+                    ];
+                } elseif ($cycle == 'triennially' && isset($rates['triennially']) && $rates['triennially'] !== '') {
+                    return [
+                        'setup' => $rates['tsetupfee'] !== '' ? $rates['tsetupfee'] : '0.00',
+                        'recurring' => $rates['triennially']
+                    ];
+                } elseif (($cycle == 'onetime' || $cycle == 'one time') && isset($rates['monthly']) && $rates['monthly'] !== '') {
+                    return [
+                        'setup' => $rates['msetupfee'] !== '' ? $rates['msetupfee'] : '0.00',
+                        'recurring' => $rates['monthly']
+                    ];
+                }
+            }
+        }
+    } catch (\Exception $e) {}
+});
+
+/**
+ * Hook to dynamically override addon pricing based on brand
+ */
+add_hook('OrderAddonPricingOverride', 1, function ($vars) {
+    $brand = get_multibrand_active_brand();
+    if (!$brand || !$brand->price_override) {
+        return;
+    }
+
+    try {
+        $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+        $addonId = $vars['addonid'];
+        $addonOverrides = $pricingOverrides['addons'][$addonId]['pricing'] ?? [];
+        
+        if (!empty($addonOverrides)) {
+            $currencyId = (int)($_SESSION['currency'] ?? 1);
+            $rates = $addonOverrides[$currencyId] ?? [];
+            if (!empty($rates)) {
+                $cycles = [
+                    'monthly' => ['price' => 'monthly', 'setup' => 'msetupfee'],
+                    'quarterly' => ['price' => 'quarterly', 'setup' => 'qsetupfee'],
+                    'semiannually' => ['price' => 'semiannually', 'setup' => 'ssetupfee'],
+                    'annually' => ['price' => 'annually', 'setup' => 'asetupfee'],
+                    'biennially' => ['price' => 'biennially', 'setup' => 'bsetupfee'],
+                    'triennially' => ['price' => 'triennially', 'setup' => 'tsetupfee']
+                ];
+                
+                foreach ($cycles as $c => $keys) {
+                    if (isset($rates[$keys['price']]) && $rates[$keys['price']] !== '') {
+                        return [
+                            'setup' => $rates[$keys['setup']] !== '' ? $rates[$keys['setup']] : '0.00',
+                            'recurring' => $rates[$keys['price']]
+                        ];
+                    }
+                }
+            }
+        }
+    } catch (\Exception $e) {}
+});
+
+/**
+ * Hook to dynamically override domain pricing based on brand
+ */
+add_hook('OrderDomainPricingOverride', 1, function ($vars) {
+    $brand = get_multibrand_active_brand();
+    if (!$brand || !$brand->price_override) {
+        return;
+    }
+
+    try {
+        $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+        $sld = $vars['sld'];
+        $tld = $vars['tld'];
+        $regperiod = (int)$vars['regperiod'];
+        
+        $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $tld)->first();
+        if ($domainTemplate) {
+            $domainId = $domainTemplate->id;
+            $domainOverrides = $pricingOverrides['domains'][$domainId]['pricing'] ?? [];
+            
+            if (!empty($domainOverrides)) {
+                $currencyId = (int)($_SESSION['currency'] ?? 1);
+                $rates = $domainOverrides[$currencyId] ?? [];
+                if (!empty($rates)) {
+                    $regPriceKey = 'register' . $regperiod;
+                    $transPriceKey = 'transfer' . $regperiod;
+                    $renewPriceKey = 'renew' . $regperiod;
+                    
+                    if (isset($rates[$regPriceKey]) && $rates[$regPriceKey] !== '') {
+                        return [
+                            'register' => $rates[$regPriceKey],
+                            'transfer' => $rates[$transPriceKey] !== '' ? $rates[$transPriceKey] : '0.00',
+                            'renew'    => $rates[$renewPriceKey] !== '' ? $rates[$renewPriceKey] : '0.00',
+                        ];
+                    }
+                }
+            }
+        }
+    } catch (\Exception $e) {}
+});
+
 
 
