@@ -79,6 +79,7 @@ function multibrand_activate()
                 $table->boolean('auto_client_assignment')->default(0);
                 $table->string('tos_url')->nullable();
                 $table->text('signature')->nullable();
+                $table->text('payment_gateways')->nullable();
                 $table->timestamps();
             });
         } else {
@@ -149,6 +150,9 @@ function multibrand_activate()
                 }
                 if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'signature')) {
                     $table->text('signature')->nullable();
+                }
+                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'payment_gateways')) {
+                    $table->text('payment_gateways')->nullable();
                 }
             });
         }
@@ -240,6 +244,21 @@ function multibrand_activate()
                 $table->integer('brand_id');
                 $table->timestamps();
                 $table->unique(['email_id', 'brand_id'], 'mod_email_brand_unique');
+            });
+        }
+
+        // Create table for branded email templates if needed
+        if (!Capsule::schema()->hasTable('mod_multibrand_email_templates')) {
+            Capsule::schema()->create('mod_multibrand_email_templates', function ($table) {
+                $table->increments('id');
+                $table->integer('brand_id');
+                $table->string('template_name');
+                $table->boolean('status')->default(0);
+                $table->text('copy_to')->nullable();
+                $table->text('blind_copy_to')->nullable();
+                $table->text('translations')->nullable();
+                $table->timestamps();
+                $table->unique(['brand_id', 'template_name']);
             });
         }
 

@@ -185,7 +185,11 @@ function get_multibrand_active_brand()
     $requestHostClean = ltrim($requestHost, 'www.');
 
     try {
-        $brands = Capsule::table('mod_multibrand_brands')->where('status', 1)->get();
+        $brands = Capsule::table('mod_multibrand_brands')
+            ->where('status', 1)
+            ->orderBy('is_default', 'desc')
+            ->orderBy('id', 'asc')
+            ->get();
 
         // Exact/clean hostname match first
         foreach ($brands as $brand) {
@@ -237,7 +241,11 @@ function get_multibrand_brand_by_domain()
     $requestHostClean = ltrim($requestHost, 'www.');
 
     try {
-        $brands = Capsule::table('mod_multibrand_brands')->where('status', 1)->get();
+        $brands = Capsule::table('mod_multibrand_brands')
+            ->where('status', 1)
+            ->orderBy('is_default', 'desc')
+            ->orderBy('id', 'asc')
+            ->get();
 
         // Exact/clean hostname match first
         foreach ($brands as $brand) {
@@ -274,67 +282,557 @@ function get_multibrand_brand_by_domain()
 }
 
 /**
- * Client Area Page Hook
- * Overrides company name, logo, and other branding elements
+ * Client Area Initialization Hook
+ * Dynamically changes the active global template theme in memory before the Smarty engine boots.
+ * This ensures WHMCS loads the brand's custom theme fully (headers, footers, CSS) and prevents mismatches.
  */
-// add_hook('ClientAreaPage', 1, function ($vars) {
-//     $brand = get_multibrand_active_brand();
-//
-//     if ($brand) {
-//         // Maintenance Mode handling
-//         if ($brand->maintenance_mode) {
-//             if ($brand->maintenance_mode_redirect_url) {
-//                 header("Location: " . $brand->maintenance_mode_redirect_url);
-//                 exit;
-//             } else {
-//                 $message = $brand->maintenance_mode_message ?: "We are currently performing maintenance and will be back shortly.";
-//                 die('<div style="text-align:center; margin-top:50px; font-family: sans-serif;"><h1>Maintenance Mode</h1><p>' . nl2br(htmlspecialchars($message)) . '</p></div>');
-//             }
-//         }
-//
-//         $overrides = [];
-//
-//         if ($brand->company_name) {
-//             $overrides['companyname'] = $brand->company_name;
-//         }
-//
-//         if ($brand->logo_url) {
-//             $overrides['logo'] = $brand->logo_url;
-//             $overrides['assetLogoPath'] = $brand->logo_url;
-//         }
-//
-//         if ($brand->system_theme) {
-//             $overrides['template'] = $brand->system_theme;
-//         }
-//
-//         return $overrides;
-//     }
-// });
+add_hook('ClientAreaInit', 1, function ($vars) {
+    $brand = get_multibrand_active_brand();
+    if ($brand && $brand->system_theme) {
+        $theme = strtolower($brand->system_theme);
+        $GLOBALS['CONFIG']['Template'] = $theme;
+        $GLOBALS['CONFIG']['systpl'] = $theme;
+    }
+});
 
 /**
- * Email Pre Send Hook
- * Overrides brand details in outgoing emails
+ * Client Area Page Hook
+ * Overrides company name, logo, language, and other branding elements.
+ * Also handles Maintenance Mode, custom TOS, and HTML Invoice page overrides.
  */
-add_hook('EmailPreSend', 1, function ($vars) {
-    $brand = get_multibrand_active_brand();
+add_hook('ClientAreaPage', 1, function ($vars) {
+    $brand = null;
+    $filename = $vars['filename'] ?? '';
+
+    // If viewing a specific HTML invoice, resolve brand dynamically by the invoice
+    if ($filename == 'viewinvoice' && isset($_GET['id'])) {
+        $invoiceId = (int)$_GET['id'];
+        try {
+            $invBrand = Capsule::table('mod_multibrand_invoice_brands')->where('invoice_id', $invoiceId)->first();
+            if ($invBrand) {
+                $brand = Capsule::table('mod_multibrand_brands')->where('id', $invBrand->brand_id)->where('status', 1)->first();
+            }
+        } catch (\Exception $e) {}
+    }
+
+    // Fallback to active domain domain-match brand
+    if (!$brand) {
+        $brand = get_multibrand_active_brand();
+    }
 
     if ($brand) {
-        $merge_fields = [];
+        // Maintenance Mode handling
+        if ($brand->maintenance_mode) {
+            if ($brand->maintenance_mode_redirect_url) {
+                header("Location: " . $brand->maintenance_mode_redirect_url);
+                exit;
+            } else {
+                $message = $brand->maintenance_mode_message ?: "We are currently performing maintenance and will be back shortly.";
+                die('<div style="text-align:center; margin-top:50px; font-family: sans-serif;"><h1>Maintenance Mode</h1><p>' . nl2br(htmlspecialchars($message)) . '</p></div>');
+            }
+        }
+
+        $overrides = [];
 
         if ($brand->company_name) {
-            $merge_fields['company_name'] = $brand->company_name;
+            $overrides['companyname'] = $brand->company_name;
         }
 
         if ($brand->logo_url) {
-            $merge_fields['company_logo_url'] = $brand->logo_url;
+            $overrides['logo'] = $brand->logo_url;
+            $overrides['assetLogoPath'] = $brand->logo_url;
         }
 
-        if ($brand->pay_to_text) {
-            $merge_fields['signature'] = nl2br($brand->pay_to_text);
+        if ($brand->default_language) {
+            $overrides['language'] = strtolower($brand->default_language);
         }
 
-        return ['mergefields' => $merge_fields];
+        if ($brand->tos_url) {
+            $overrides['tosurl'] = $brand->tos_url;
+        }
+
+        // Custom HTML Invoice layout variables override
+        if ($filename == 'viewinvoice' && $brand->pay_to_text) {
+            $overrides['payto'] = nl2br($brand->pay_to_text);
+        }
+
+        return $overrides;
     }
+});
+
+/**
+ * Order Page Hook
+ * Dynamically overrides the cart template matching the brand's order template
+ */
+add_hook('OrderPage', 1, function ($vars) {
+    $brand = get_multibrand_active_brand();
+    if ($brand && $brand->order_template) {
+        return [
+            'carttemplate' => $brand->order_template
+        ];
+    }
+});
+
+/**
+ * Invoice PDF Template Hook
+ * Dynamically brands the downloaded invoice PDF document
+ */
+add_hook('InvoicePdfTemplate', 1, function ($vars) {
+    $invoiceId = $vars['invoiceid'];
+    $brand = null;
+    
+    try {
+        $invBrand = Capsule::table('mod_multibrand_invoice_brands')->where('invoice_id', $invoiceId)->first();
+        if ($invBrand) {
+            $brand = Capsule::table('mod_multibrand_brands')->where('id', $invBrand->brand_id)->where('status', 1)->first();
+        }
+    } catch (\Exception $e) {}
+    
+    if (!$brand) {
+        $brand = get_multibrand_active_brand();
+    }
+    
+    if ($brand) {
+        $overrides = [];
+        
+        if ($brand->company_name) {
+            $overrides['companyname'] = $brand->company_name;
+        }
+        
+        if ($brand->logo_url) {
+            $overrides['logo'] = $brand->logo_url;
+        }
+        
+        if ($brand->pay_to_text) {
+            $overrides['payto'] = $brand->pay_to_text;
+        }
+        
+        return $overrides;
+    }
+});
+
+/**
+ * Client Area Primary Navbar Hook
+ * Appends the Brand Switcher dropdown menu if enabled and client has multiple assigned brands
+ */
+add_hook('ClientAreaPrimaryNavbar', 1, function ($primaryNavbar) {
+    $brand = get_multibrand_active_brand();
+    if (!$brand || !$brand->brand_switcher) {
+        return;
+    }
+    
+    $loggedInClientId = (int)($_SESSION['uid'] ?? 0);
+    if ($loggedInClientId === 0) {
+        return;
+    }
+    
+    try {
+        $assignedBrands = Capsule::table('mod_multibrand_client_brands')
+            ->join('mod_multibrand_brands', 'mod_multibrand_client_brands.brand_id', '=', 'mod_multibrand_brands.id')
+            ->where('mod_multibrand_client_brands.client_id', $loggedInClientId)
+            ->where('mod_multibrand_brands.status', 1)
+            ->select('mod_multibrand_brands.brand_name', 'mod_multibrand_brands.system_url', 'mod_multibrand_brands.domain')
+            ->get();
+            
+        if ($assignedBrands->count() > 1) {
+            // Add "Brands" dropdown menu item
+            $brandsMenu = $primaryNavbar->addChild('Brands', [
+                'label' => 'Brands',
+                'uri' => '#',
+                'order' => 90, // Places it next to account settings
+            ]);
+            $brandsMenu->setDropdown(true);
+            
+            foreach ($assignedBrands as $ab) {
+                $url = $ab->system_url ?: ($ab->domain ? 'http://' . $ab->domain : '#');
+                $brandsMenu->addChild($ab->brand_name, [
+                    'label' => $ab->brand_name,
+                    'uri' => $url,
+                    'order' => 10,
+                ]);
+            }
+        }
+    } catch (\Exception $e) {}
+});
+
+/**
+ * Client Area Footer Output Hook
+ * Handles department filtering inside Open Support Ticket page dynamically
+ */
+add_hook('ClientAreaFooterOutput', 1, function ($vars) {
+    $brand = get_multibrand_active_brand();
+    if ($brand && $brand->ticket_departments) {
+        $brandDepts = array_values(array_filter(array_map('intval', explode(',', $brand->ticket_departments))));
+        
+        $filename = $vars['filename'] ?? '';
+        
+        if (in_array($filename, ['supporttickets', 'submitticket']) && !empty($brandDepts)) {
+            $jsonDepts = json_encode($brandDepts);
+            return "
+            <script>
+                $(document).ready(function() {
+                    var brandDepts = $jsonDepts;
+                    
+                    // 1. Hide non-assigned departments in Step 1 (selection grids/links)
+                    $('a').each(function() {
+                        var href = $(this).attr('href') || '';
+                        var match = href.match(/deptid=(\d+)/);
+                        if (match) {
+                            var deptId = parseInt(match[1], 10);
+                            if ($.inArray(deptId, brandDepts) === -1) {
+                                $(this).closest('.panel, .list-group-item, .dept-box, .btn, tr').hide();
+                            }
+                        }
+                    });
+                    
+                    // 2. Remove non-assigned departments from Dropdown list in Step 2 (open ticket form)
+                    var select = $('select[name=\"deptid\"]');
+                    if (select.length) {
+                        select.find('option').each(function() {
+                            var val = parseInt($(this).val(), 10);
+                            if (val > 0 && $.inArray(val, brandDepts) === -1) {
+                                $(this).remove();
+                            }
+                        });
+                    }
+                });
+            </script>
+            ";
+        }
+    }
+});
+
+/**
+ * Safe Multi-Brand Outgoing Email & Configuration Override Manager
+ */
+if (!class_exists('MultiBrandEmailOverrideManager')) {
+    class MultiBrandEmailOverrideManager
+    {
+        private static $backup = null;
+        private static $isShutdownRegistered = false;
+
+        public static function apply($brand)
+        {
+            if (self::$backup !== null) {
+                return;
+            }
+
+            $configKeys = [
+                'MailType',
+                'SMTPHost',
+                'SMTPPort',
+                'SMTPUsername',
+                'SMTPPassword',
+                'SMTPSSL',
+                'DisableEmailSending',
+                'EmailCSS',
+                'EmailGlobalHeader',
+                'EmailGlobalFooter',
+                'SystemEmailsFromEmail',
+                'SystemEmailsFromName'
+            ];
+
+            // 1. Backup original configuration
+            self::$backup = [];
+            foreach ($configKeys as $key) {
+                $row = \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', $key)->first();
+                self::$backup[$key] = $row ? $row->value : null;
+            }
+
+            // 2. Prepare overrides
+            $overrides = [];
+
+            // SMTP overrides
+            $smtp = json_decode(htmlspecialchars_decode($brand->smtp_settings ?: '{}'), true);
+            if (!empty($smtp['override'])) {
+                $overrides['MailType'] = !empty($smtp['mail_type']) ? $smtp['mail_type'] : 'SMTP';
+                $overrides['SMTPHost'] = !empty($smtp['hostname']) ? $smtp['hostname'] : '';
+                $overrides['SMTPPort'] = !empty($smtp['port']) ? $smtp['port'] : '';
+                $overrides['SMTPUsername'] = !empty($smtp['username']) ? $smtp['username'] : '';
+                if (isset($smtp['password']) && $smtp['password'] !== '') {
+                    $overrides['SMTPPassword'] = encrypt($smtp['password']);
+                }
+                $overrides['SMTPSSL'] = !empty($smtp['ssl_type']) ? $smtp['ssl_type'] : '';
+                
+                if (!empty($smtp['disable_email'])) {
+                    $overrides['DisableEmailSending'] = 'on';
+                } else {
+                    $overrides['DisableEmailSending'] = '';
+                }
+            }
+
+            // CSS/Header/Footer template overrides
+            $email_templates = json_decode(htmlspecialchars_decode($brand->email_template_settings ?: '{}'), true);
+            if (!empty($email_templates['css'])) {
+                $overrides['EmailCSS'] = $email_templates['css'];
+            }
+            if (!empty($email_templates['header'])) {
+                $overrides['EmailGlobalHeader'] = $email_templates['header'];
+            }
+            if (!empty($email_templates['footer'])) {
+                $overrides['EmailGlobalFooter'] = $email_templates['footer'];
+            }
+
+            // From Name and From Email overrides
+            if (!empty($brand->email_address)) {
+                $overrides['SystemEmailsFromEmail'] = $brand->email_address;
+            }
+            if (!empty($brand->company_name)) {
+                $overrides['SystemEmailsFromName'] = $brand->company_name;
+            }
+
+            // 3. Apply overrides
+            foreach ($overrides as $key => $val) {
+                \WHMCS\Database\Capsule::table('tblconfiguration')->updateOrInsert(['setting' => $key], ['value' => $val]);
+            }
+
+            // 4. Shutdown fallback restorer
+            if (!self::$isShutdownRegistered) {
+                register_shutdown_function([self::class, 'restore']);
+                self::$isShutdownRegistered = true;
+            }
+        }
+
+        public static function restore()
+        {
+            if (self::$backup === null) {
+                return;
+            }
+
+            // Restore original settings
+            foreach (self::$backup as $key => $val) {
+                if ($val === null) {
+                    \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', $key)->delete();
+                } else {
+                    \WHMCS\Database\Capsule::table('tblconfiguration')->updateOrInsert(['setting' => $key], ['value' => $val]);
+                }
+            }
+
+            self::$backup = null;
+        }
+    }
+}
+
+/**
+ * Email Pre Send Hook
+ * Overrides brand SMTP server credentials, custom templates, and styling details in outgoing emails
+ */
+add_hook('EmailPreSend', 1, function ($vars) {
+    $brand = null;
+    $resolvedBrandId = 0;
+
+    // 1. Try to find brand by related entity in $vars['relid']
+    $relid = isset($vars['relid']) ? (int)$vars['relid'] : 0;
+    $messagename = isset($vars['messagename']) ? $vars['messagename'] : '';
+
+    if ($relid > 0) {
+        // Invoice-related emails
+        if (stripos($messagename, 'Invoice') !== false || stripos($messagename, 'Payment') !== false || stripos($messagename, 'Credit') !== false) {
+            try {
+                $invBrand = \WHMCS\Database\Capsule::table('mod_multibrand_invoice_brands')->where('invoice_id', $relid)->first();
+                if ($invBrand) {
+                    $resolvedBrandId = $invBrand->brand_id;
+                } else {
+                    $invoice = \WHMCS\Database\Capsule::table('tblinvoices')->where('id', $relid)->first();
+                    if ($invoice) {
+                        $clientBrand = \WHMCS\Database\Capsule::table('mod_multibrand_client_brands')->where('client_id', $invoice->userid)->first();
+                        if ($clientBrand) {
+                            $resolvedBrandId = $clientBrand->brand_id;
+                        }
+                    }
+                }
+            } catch (\Exception $e) {}
+        }
+        // Support/Ticket-related emails
+        elseif (stripos($messagename, 'Ticket') !== false || stripos($messagename, 'Support') !== false) {
+            try {
+                $ticketBrand = \WHMCS\Database\Capsule::table('mod_multibrand_ticket_brands')->where('ticket_id', $relid)->first();
+                if ($ticketBrand) {
+                    $resolvedBrandId = $ticketBrand->brand_id;
+                } else {
+                    $ticket = \WHMCS\Database\Capsule::table('tbltickets')->where('id', $relid)->first();
+                    if ($ticket) {
+                        $clientBrand = \WHMCS\Database\Capsule::table('mod_multibrand_client_brands')->where('client_id', $ticket->userid)->first();
+                        if ($clientBrand) {
+                            $resolvedBrandId = $clientBrand->brand_id;
+                        }
+                    }
+                }
+            } catch (\Exception $e) {}
+        }
+        // Service/Product emails
+        elseif (stripos($messagename, 'Welcome') !== false || stripos($messagename, 'Service') !== false || stripos($messagename, 'Hosting') !== false || stripos($messagename, 'Product') !== false || stripos($messagename, 'Suspension') !== false || stripos($messagename, 'Termination') !== false) {
+            try {
+                $serviceBrand = \WHMCS\Database\Capsule::table('mod_multibrand_service_brands')->where('service_id', $relid)->first();
+                if ($serviceBrand) {
+                    $resolvedBrandId = $serviceBrand->brand_id;
+                } else {
+                    $service = \WHMCS\Database\Capsule::table('tblhosting')->where('id', $relid)->first();
+                    if ($service) {
+                        $clientBrand = \WHMCS\Database\Capsule::table('mod_multibrand_client_brands')->where('client_id', $service->userid)->first();
+                        if ($clientBrand) {
+                            $resolvedBrandId = $clientBrand->brand_id;
+                        }
+                    }
+                }
+            } catch (\Exception $e) {}
+        }
+        // Domain emails
+        elseif (stripos($messagename, 'Domain') !== false) {
+            try {
+                $domainBrand = \WHMCS\Database\Capsule::table('mod_multibrand_domain_brands')->where('domain_id', $relid)->first();
+                if ($domainBrand) {
+                    $resolvedBrandId = $domainBrand->brand_id;
+                } else {
+                    $domain = \WHMCS\Database\Capsule::table('tbldomains')->where('id', $relid)->first();
+                    if ($domain) {
+                        $clientBrand = \WHMCS\Database\Capsule::table('mod_multibrand_client_brands')->where('client_id', $domain->userid)->first();
+                        if ($clientBrand) {
+                            $resolvedBrandId = $clientBrand->brand_id;
+                        }
+                    }
+                }
+            } catch (\Exception $e) {}
+        }
+
+        // Fallback: If $relid is a client ID directly
+        if ($resolvedBrandId === 0) {
+            try {
+                $clientExists = \WHMCS\Database\Capsule::table('tblclients')->where('id', $relid)->exists();
+                if ($clientExists) {
+                    $clientBrand = \WHMCS\Database\Capsule::table('mod_multibrand_client_brands')->where('client_id', $relid)->first();
+                    if ($clientBrand) {
+                        $resolvedBrandId = $clientBrand->brand_id;
+                    }
+                }
+            } catch (\Exception $e) {}
+        }
+    }
+
+    // 2. If not resolved yet, check client ID from mergefields
+    if ($resolvedBrandId === 0 && isset($vars['mergefields'])) {
+        $clientIdsKeys = ['client_id', 'userid', 'clientid', 'id'];
+        foreach ($clientIdsKeys as $ck) {
+            if (isset($vars['mergefields'][$ck]) && is_numeric($vars['mergefields'][$ck])) {
+                $cid = (int)$vars['mergefields'][$ck];
+                try {
+                    $clientExists = \WHMCS\Database\Capsule::table('tblclients')->where('id', $cid)->exists();
+                    if ($clientExists) {
+                        $clientBrand = \WHMCS\Database\Capsule::table('mod_multibrand_client_brands')->where('client_id', $cid)->first();
+                        if ($clientBrand) {
+                            $resolvedBrandId = $clientBrand->brand_id;
+                            break;
+                        }
+                    }
+                } catch (\Exception $e) {}
+            }
+        }
+    }
+
+    // 3. Look up brand details if brand ID is resolved
+    if ($resolvedBrandId > 0) {
+        try {
+            $brand = \WHMCS\Database\Capsule::table('mod_multibrand_brands')->where('id', $resolvedBrandId)->where('status', 1)->first();
+        } catch (\Exception $e) {}
+    }
+
+    // 4. Fallback to active domain domain-match brand
+    if (!$brand) {
+        $brand = get_multibrand_active_brand();
+    }
+
+    if ($brand) {
+        // Apply configuration overrides temporarily in tblconfiguration
+        MultiBrandEmailOverrideManager::apply($brand);
+
+        // Populate custom merge fields for email headers/footers
+        $merge_fields = [];
+        $merge_fields['company_name'] = !empty($brand->company_name) ? $brand->company_name : '';
+        $merge_fields['company_domain'] = !empty($brand->domain) ? $brand->domain : '';
+        $merge_fields['company_logo_url'] = !empty($brand->logo_url) ? $brand->logo_url : '';
+        $merge_fields['whmcs_url'] = !empty($brand->system_url) ? $brand->system_url : '';
+        $merge_fields['whmcs_link'] = !empty($brand->system_url) ? '<a href="' . $brand->system_url . '">' . (!empty($brand->company_name) ? $brand->company_name : $brand->brand_name) . '</a>' : '';
+        $merge_fields['signature'] = !empty($brand->signature) ? nl2br($brand->signature) : '';
+        $merge_fields['date'] = date('Y-m-d');
+        $merge_fields['time'] = date('H:i:s');
+
+        // Look up custom template overrides
+        $overrides = [];
+        try {
+            $brandedTemplate = \WHMCS\Database\Capsule::table('mod_multibrand_email_templates')
+                ->where('brand_id', $brand->id)
+                ->where('template_name', $messagename)
+                ->where('status', 1)
+                ->first();
+                
+            if ($brandedTemplate) {
+                // Resolve client's language
+                $clientLang = '';
+                $clientId = 0;
+                
+                if (isset($vars['mergefields']['client_id'])) {
+                    $clientId = (int)$vars['mergefields']['client_id'];
+                } elseif (isset($vars['mergefields']['userid'])) {
+                    $clientId = (int)$vars['mergefields']['userid'];
+                } elseif (isset($vars['mergefields']['clientid'])) {
+                    $clientId = (int)$vars['mergefields']['clientid'];
+                }
+                
+                if ($clientId > 0) {
+                    $client = \WHMCS\Database\Capsule::table('tblclients')->where('id', $clientId)->first();
+                    if ($client) {
+                        $clientLang = strtolower($client->language);
+                    }
+                }
+                
+                if (empty($clientLang) && !empty($brand->default_language)) {
+                    $clientLang = strtolower($brand->default_language);
+                }
+                
+                $translations = json_decode(htmlspecialchars_decode($brandedTemplate->translations ?: '{}'), true) ?: [];
+                
+                $subject = '';
+                $message = '';
+                
+                if (!empty($clientLang) && isset($translations[$clientLang])) {
+                    $subject = $translations[$clientLang]['subject'];
+                    $message = $translations[$clientLang]['message'];
+                }
+                
+                if (empty($subject) && isset($translations['default'])) {
+                    $subject = $translations['default']['subject'];
+                    $message = $translations['default']['message'];
+                }
+                
+                if (!empty($subject)) {
+                    $overrides['subject'] = $subject;
+                }
+                if (!empty($message)) {
+                    $overrides['message'] = $message;
+                }
+                if (!empty($brandedTemplate->copy_to)) {
+                    $overrides['cc'] = $brandedTemplate->copy_to;
+                }
+                if (!empty($brandedTemplate->blind_copy_to)) {
+                    $overrides['bcc'] = $brandedTemplate->blind_copy_to;
+                }
+            }
+        } catch (\Exception $e) {}
+
+        $returnVars = ['mergefields' => $merge_fields];
+        if (!empty($overrides)) {
+            $returnVars = array_merge($returnVars, $overrides);
+        }
+        return $returnVars;
+    }
+});
+
+/**
+ * Email Post Send Hook
+ * Restores the original WHMCS configuration immediately after sending
+ */
+add_hook('EmailPostSend', 1, function ($vars) {
+    MultiBrandEmailOverrideManager::restore();
 });
 
 /**
@@ -345,8 +843,63 @@ add_hook('ClientAreaHeadOutput', 1, function ($vars) {
     $brand = get_multibrand_active_brand();
 
     if ($brand) {
-        // You can inject custom CSS here to further brand the page if needed
-        return '<!-- Multi Brand Applied: ' . htmlspecialchars($brand->brand_name) . ' -->';
+        $html = '<!-- Multi Brand Applied: ' . htmlspecialchars($brand->brand_name) . ' -->';
+        
+        // Inject brand custom color and logo stylesheet dynamically
+        if ($brand->brand_color) {
+            $color = htmlspecialchars($brand->brand_color);
+            $html .= "
+            <style>
+                /* Root CSS Custom Properties override for modern templates (e.g. Twenty One) */
+                :root {
+                    --primary-color: $color !important;
+                    --primary: $color !important;
+                    --primary-bg-color: $color !important;
+                    --brand-color: $color !important;
+                }
+                /* Auto-injected Premium Brand Colors */
+                .navbar-main, .navbar-default, .primary-nav, .brand-color-bg, .navbar-main .navbar-nav > li > a:hover {
+                    background-color: $color !important;
+                    border-color: $color !important;
+                }
+                .btn-primary, .btn-primary:hover, .btn-primary:focus, .btn-primary:active, .btn-primary.active, .btn-info, .btn-info:hover {
+                    background-color: $color !important;
+                    border-color: $color !important;
+                }
+                a, a:hover, a:focus, .text-primary, .navbar-main .navbar-nav > .active > a, .navbar-main .navbar-nav > .active > a:hover {
+                    color: $color !important;
+                }
+                .sidebar .panel-header, .panel-primary > .panel-heading, .panel-primary, .panel-sidebar > .panel-heading, .list-group-item.active, .list-group-item.active:hover, .list-group-item.active:focus {
+                    background-color: $color !important;
+                    border-color: $color !important;
+                }
+                /* Dynamic visual accents */
+                .label-primary, .badge-primary, .badge-info, .label-info {
+                    background-color: $color !important;
+                }
+            </style>
+            ";
+        }
+        
+        if ($brand->logo_url) {
+            $logo = htmlspecialchars($brand->logo_url);
+            $html .= "
+            <style>
+                .navbar-brand img, .logo img, #header .logo img, #logo img, .logo-img {
+                    content: url('$logo') !important;
+                }
+            </style>
+            <script>
+                $(document).ready(function() {
+                    $('.navbar-brand img, .logo img, #header .logo img, #logo img, .logo-img').each(function() {
+                        $(this).attr('src', '$logo');
+                    });
+                });
+            </script>
+            ";
+        }
+        
+        return $html;
     }
 });
 
@@ -420,28 +973,241 @@ add_hook('AdminAreaClientSummaryPage', 1, function ($vars) {
         ->select('mod_multibrand_brands.brand_name', 'mod_multibrand_brands.brand_color')
         ->get();
 
+    $tagsHtml = '';
     if ($clientBrands->count() > 0) {
-        $tagsHtml = '';
         foreach ($clientBrands as $cb) {
             $name = htmlspecialchars($cb->brand_name);
             $color = htmlspecialchars($cb->brand_color ?: '#666');
             $tagsHtml .= " <span class='label' style='background-color: $color; color: #fff; font-size: 0.85em; padding: 2px 8px; border-radius: 4px; vertical-align: middle; margin-left: 5px; font-weight: bold;'>$name</span>";
         }
-
-        return "
-        <script>
-            $(document).ready(function() {
-                var brandTags = \"" . addslashes($tagsHtml) . "\";
-                
-                // Try multiple possible locations for the email in different WHMCS versions
-                var emailTarget = $('a[href^=\"mailto:\"], .email-address, td:contains(\"@\")').first();
-                if (emailTarget.length) {
-                    emailTarget.after(brandTags);
-                }
-            });
-        </script>
-        ";
     }
+
+    // Fetch all hosting service brand mappings for this client
+    $serviceBrandsMap = [];
+    try {
+        $clientServiceIds = Capsule::table('tblhosting')
+            ->where('userid', $userid)
+            ->pluck('id')
+            ->toArray();
+            
+        if (!empty($clientServiceIds)) {
+            $sBrands = Capsule::table('mod_multibrand_service_brands')
+                ->join('mod_multibrand_brands', 'mod_multibrand_service_brands.brand_id', '=', 'mod_multibrand_brands.id')
+                ->whereIn('mod_multibrand_service_brands.service_id', $clientServiceIds)
+                ->select('mod_multibrand_service_brands.service_id', 'mod_multibrand_brands.brand_name', 'mod_multibrand_brands.brand_color')
+                ->get();
+                
+            foreach ($sBrands as $sb) {
+                $serviceBrandsMap[$sb->service_id] = [
+                    'brand_name' => $sb->brand_name,
+                    'brand_color' => $sb->brand_color ?: '#666'
+                ];
+            }
+        }
+    } catch (\Exception $e) {}
+
+    // Fetch all invoice brand mappings for this client
+    $invoiceBrandsMap = [];
+    try {
+        $clientInvoiceIds = Capsule::table('tblinvoices')
+            ->where('userid', $userid)
+            ->pluck('id')
+            ->toArray();
+            
+        if (!empty($clientInvoiceIds)) {
+            $iBrands = Capsule::table('mod_multibrand_invoice_brands')
+                ->join('mod_multibrand_brands', 'mod_multibrand_invoice_brands.brand_id', '=', 'mod_multibrand_brands.id')
+                ->whereIn('mod_multibrand_invoice_brands.invoice_id', $clientInvoiceIds)
+                ->select('mod_multibrand_invoice_brands.invoice_id', 'mod_multibrand_brands.brand_name', 'mod_multibrand_brands.brand_color')
+                ->get();
+                
+            foreach ($iBrands as $ib) {
+                $invoiceBrandsMap[$ib->invoice_id] = [
+                    'brand_name' => $ib->brand_name,
+                    'brand_color' => $ib->brand_color ?: '#666'
+                ];
+            }
+        }
+    } catch (\Exception $e) {}
+
+    return "
+    <script>
+        $(document).ready(function() {
+            var brandTags = \"" . addslashes($tagsHtml) . "\";
+            
+            // Find email link or email td cell to place badge inside the cell
+            var emailLink = $('a[href^=\"mailto:\"]');
+            if (emailLink.length) {
+                if (!emailLink.next('.mb-brand-badge').length) {
+                    emailLink.after('<span class=\"mb-brand-badge\">' + brandTags + '</span>');
+                }
+            } else {
+                var emailTd = $('td:contains(\"@\")').first();
+                if (emailTd.length) {
+                    if (!emailTd.find('.mb-brand-badge').length) {
+                        emailTd.append('<span class=\"mb-brand-badge\">' + brandTags + '</span>');
+                    }
+                }
+            }
+            
+            // Service & Invoice Brand mappings
+            var serviceBrands = " . json_encode($serviceBrandsMap) . ";
+            var invoiceBrands = " . json_encode($invoiceBrandsMap) . ";
+            
+            function decorateClientSummaryTables() {
+                $('table').each(function() {
+                    var table = $(this);
+                    
+                    // 1. PRODUCTS / SERVICES TABLE DECORATION
+                    var productCol = table.find('th:contains(\"Product/Service\")');
+                    if (productCol.length > 0) {
+                        var idColIndex = -1;
+                        
+                        // Find ID column index
+                        table.find('th').each(function(index) {
+                            var text = $(this).text().trim();
+                            if (text === 'ID') {
+                                idColIndex = index;
+                            }
+                        });
+                        
+                        if (idColIndex !== -1) {
+                            // Add \"Brand\" header to each header row if not present
+                            table.find('thead tr, tr:first').each(function() {
+                                var headerRow = $(this);
+                                if (headerRow.find('th').length > 0) {
+                                    var brandHeader = headerRow.find('th:contains(\"Brand\")');
+                                    if (brandHeader.length === 0) {
+                                        var lastTh = headerRow.find('th').last();
+                                        lastTh.after('<th class=\"text-center mb-brand-header\" style=\"font-weight: bold;\">Brand</th>');
+                                    }
+                                }
+                            });
+                            
+                            // Loop over each row in tbody
+                            table.find('tbody tr').each(function() {
+                                var row = $(this);
+                                
+                                // Prevent duplicate processing of the same row
+                                if (row.hasClass('mb-processed-row')) {
+                                    return;
+                                }
+                                
+                                var cells = row.find('td');
+                                
+                                // Handle empty table placeholder (colspan)
+                                if (cells.length === 1 && cells.first().attr('colspan')) {
+                                    var currentColspan = parseInt(cells.first().attr('colspan'), 10);
+                                    cells.first().attr('colspan', currentColspan + 1);
+                                    row.addClass('mb-processed-row');
+                                    return;
+                                }
+                                
+                                if (cells.length > idColIndex) {
+                                    var serviceId = cells.eq(idColIndex).text().trim();
+                                    var badge = '';
+                                    
+                                    if (serviceId && serviceBrands[serviceId]) {
+                                        var brand = serviceBrands[serviceId];
+                                        var name = brand.brand_name;
+                                        var color = brand.brand_color || '#666';
+                                        badge = \"<span class='label' style='background-color: \" + color + \"; color: #fff; font-size: 0.8em; padding: 2px 6px; border-radius: 3px; font-weight: bold; vertical-align: middle;'>\" + name + \"</span>\";
+                                    }
+                                    
+                                    // Insert the new cell after the last actions cell
+                                    var lastCell = cells.last();
+                                    lastCell.after('</td class=\"text-center mb-brand-cell\" style=\"vertical-align: middle;\">' + badge + '</td>');
+                                    row.addClass('mb-processed-row');
+                                }
+                            });
+                        }
+                    }
+                    
+                    // 2. INVOICES TABLE DECORATION
+                    var invoiceCol = table.find('th:contains(\"Invoice #\")');
+                    if (invoiceCol.length > 0) {
+                        var idColIndex = -1;
+                        
+                        // Find \"Invoice #\" column index
+                        table.find('th').each(function(index) {
+                            var text = $(this).text().trim();
+                            if (text === 'Invoice #') {
+                                idColIndex = index;
+                            }
+                        });
+                        
+                        if (idColIndex !== -1) {
+                            // Add \"Brand\" header to each header row if not present
+                            table.find('thead tr, tr:first').each(function() {
+                                var headerRow = $(this);
+                                if (headerRow.find('th').length > 0) {
+                                    var brandHeader = headerRow.find('th:contains(\"Brand\")');
+                                    if (brandHeader.length === 0) {
+                                        var lastTh = headerRow.find('th').last();
+                                        lastTh.after('<th class=\"text-center mb-brand-header\" style=\"font-weight: bold;\">Brand</th>');
+                                    }
+                                }
+                            });
+                            
+                            // Loop over each row in tbody
+                            table.find('tbody tr').each(function() {
+                                var row = $(this);
+                                
+                                // Prevent duplicate processing of the same row
+                                if (row.hasClass('mb-processed-row')) {
+                                    return;
+                                }
+                                
+                                var cells = row.find('td');
+                                
+                                // Handle empty table placeholder (colspan)
+                                if (cells.length === 1 && cells.first().attr('colspan')) {
+                                    var currentColspan = parseInt(cells.first().attr('colspan'), 10);
+                                    cells.first().attr('colspan', currentColspan + 1);
+                                    row.addClass('mb-processed-row');
+                                    return;
+                                }
+                                
+                                if (cells.length > idColIndex) {
+                                    var invoiceIdText = cells.eq(idColIndex).text().trim();
+                                    
+                                    // Extract only numeric invoice ID
+                                    var invoiceId = invoiceIdText.replace(/[^0-9]/g, '');
+                                    
+                                    var badge = '';
+                                    if (invoiceId && invoiceBrands[invoiceId]) {
+                                        var brand = invoiceBrands[invoiceId];
+                                        var name = brand.brand_name;
+                                        var color = brand.brand_color || '#666';
+                                        badge = \"<span class='label' style='background-color: \" + color + \"; color: #fff; font-size: 0.8em; padding: 2px 6px; border-radius: 3px; font-weight: bold; vertical-align: middle;'>\" + name + \"</span>\";
+                                    }
+                                    
+                                    // Insert the new cell after the last actions cell
+                                    var lastCell = cells.last();
+                                    lastCell.after('<td class=\"text-center mb-brand-cell\" style=\"vertical-align: middle;\">' + badge + '</td>');
+                                    row.addClass('mb-processed-row');
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+            
+            // Run initially
+            decorateClientSummaryTables();
+            
+            // Re-run on datatables page changes, searches, sorting
+            $(document).on('draw.dt', 'table', function() {
+                decorateClientSummaryTables();
+            });
+            
+            // Re-run on general AJAX loads / tab switches
+            $(document).ajaxSuccess(function() {
+                decorateClientSummaryTables();
+            });
+        });
+    </script>
+    ";
 });
 
 /**
@@ -555,7 +1321,8 @@ add_hook('AdminAreaFooterOutput', 1, function ($vars) {
         'clientsservices',
         'clientshostinglist',
         'index',
-        'clientsprofile'
+        'clientsprofile',
+        'clientsinvoices'
     ];
 
     if (!in_array($vars['filename'], $supportedFilenames)) {
@@ -670,6 +1437,126 @@ add_hook('AdminAreaFooterOutput', 1, function ($vars) {
                         targetRow.after(rowHtml);
                         console.log('Brand profile field injected');
                     }
+                });
+            </script>
+            ";
+        }
+
+        // -- Client Invoices Tab Page --
+        if ($filename == 'clientsinvoices') {
+            $userid = (int)($_REQUEST['userid'] ?? $_REQUEST['id'] ?? 0);
+            
+            // Fetch all invoice brand mappings for this client
+            $invoiceBrandsMap = [];
+            try {
+                $clientInvoiceIds = Capsule::table('tblinvoices')
+                    ->where('userid', $userid)
+                    ->pluck('id')
+                    ->toArray();
+                    
+                if (!empty($clientInvoiceIds)) {
+                    $iBrands = Capsule::table('mod_multibrand_invoice_brands')
+                        ->join('mod_multibrand_brands', 'mod_multibrand_invoice_brands.brand_id', '=', 'mod_multibrand_brands.id')
+                        ->whereIn('mod_multibrand_invoice_brands.invoice_id', $clientInvoiceIds)
+                        ->select('mod_multibrand_invoice_brands.invoice_id', 'mod_multibrand_brands.brand_name', 'mod_multibrand_brands.brand_color')
+                        ->get();
+                        
+                    foreach ($iBrands as $ib) {
+                        $invoiceBrandsMap[$ib->invoice_id] = [
+                            'brand_name' => $ib->brand_name,
+                            'brand_color' => $ib->brand_color ?: '#666'
+                        ];
+                    }
+                }
+            } catch (\Exception $e) {}
+
+            return "
+            <script>
+                $(document).ready(function() {
+                    var invoiceBrands = " . json_encode($invoiceBrandsMap) . ";
+                    
+                    function decorateInvoicesTable() {
+                        $('table').each(function() {
+                            var table = $(this);
+                            var invoiceCol = table.find('th:contains(\"Invoice #\")');
+                            if (invoiceCol.length > 0) {
+                                var idColIndex = -1;
+                                
+                                // Find \"Invoice #\" column index
+                                table.find('th').each(function(index) {
+                                    var text = $(this).text().trim();
+                                    if (text === 'Invoice #') {
+                                        idColIndex = index;
+                                    }
+                                });
+                                
+                                if (idColIndex !== -1) {
+                                    // Add \"Brand\" header to each header row if not present
+                                    table.find('thead tr, tr:first').each(function() {
+                                        var headerRow = $(this);
+                                        if (headerRow.find('th').length > 0) {
+                                            var brandHeader = headerRow.find('th:contains(\"Brand\")');
+                                            if (brandHeader.length === 0) {
+                                                var lastTh = headerRow.find('th').last();
+                                                lastTh.after('<th class=\"text-center mb-brand-header\" style=\"font-weight: bold; width: 120px;\">Brand</th>');
+                                            }
+                                        }
+                                    });
+                                    
+                                    // Loop over each row in tbody
+                                    table.find('tbody tr').each(function() {
+                                        var row = $(this);
+                                        
+                                        // Prevent duplicate processing of the same row
+                                        if (row.hasClass('mb-processed-row')) {
+                                            return;
+                                        }
+                                        
+                                        var cells = row.find('td');
+                                        
+                                        // Handle empty table placeholder (colspan)
+                                        if (cells.length === 1 && cells.first().attr('colspan')) {
+                                            var currentColspan = parseInt(cells.first().attr('colspan'), 10);
+                                            cells.first().attr('colspan', currentColspan + 1);
+                                            row.addClass('mb-processed-row');
+                                            return;
+                                        }
+                                        
+                                        if (cells.length > idColIndex) {
+                                            var invoiceIdText = cells.eq(idColIndex).text().trim();
+                                            var invoiceId = invoiceIdText.replace(/[^0-9]/g, '');
+                                            
+                                            var badge = '';
+                                            if (invoiceId && invoiceBrands[invoiceId]) {
+                                                var brand = invoiceBrands[invoiceId];
+                                                var name = brand.brand_name;
+                                                var color = brand.brand_color || '#666';
+                                                badge = \"<span class='label' style='background-color: \" + color + \"; color: #fff; font-size: 0.8em; padding: 2px 6px; border-radius: 3px; font-weight: bold; vertical-align: middle;'>\" + name + \"</span>\";
+                                            }
+                                            
+                                            // Insert the new cell after the last actions cell
+                                            var lastCell = cells.last();
+                                            lastCell.after('<td class=\"text-center mb-brand-cell\" style=\"vertical-align: middle;\">' + badge + '</td>');
+                                            row.addClass('mb-processed-row');
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    }
+                    
+                    // Run initially
+                    decorateInvoicesTable();
+                    
+                    // Re-run on datatables page changes, searches, sorting
+                    $(document).on('draw.dt', 'table', function() {
+                        decorateInvoicesTable();
+                    });
+                    
+                    // Re-run on general AJAX loads / tab switches
+                    $(document).ajaxSuccess(function() {
+                        decorateInvoicesTable();
+                    });
                 });
             </script>
             ";
@@ -2298,6 +3185,143 @@ add_hook('OrderDomainPricingOverride', 1, function ($vars) {
         }
     } catch (\Exception $e) {}
 });
+
+/**
+ * Dynamic Payment Gateway Overrides for Multi Brand Addon
+ */
+function get_multibrand_request_brand()
+{
+    static $brand = null;
+    if ($brand !== null) {
+        return $brand;
+    }
+
+    try {
+        // 1. Identify by Invoice ID in request
+        $invoiceId = (int)($_REQUEST['invoiceid'] ?? $_REQUEST['id'] ?? $_POST['invoiceid'] ?? $_GET['invoiceid'] ?? 0);
+        if ($invoiceId > 0) {
+            $invBrand = Capsule::table('mod_multibrand_invoice_brands')->where('invoice_id', $invoiceId)->first();
+            if ($invBrand) {
+                $brand = Capsule::table('mod_multibrand_brands')->where('id', $invBrand->brand_id)->first();
+                if ($brand && $brand->status) {
+                    return $brand;
+                }
+            }
+        }
+
+        // 2. Identify by Order ID in request
+        $orderId = (int)($_REQUEST['orderid'] ?? $_POST['orderid'] ?? $_GET['orderid'] ?? 0);
+        if ($orderId > 0) {
+            $ordBrand = Capsule::table('mod_multibrand_order_brands')->where('order_id', $orderId)->first();
+            if ($ordBrand) {
+                $brand = Capsule::table('mod_multibrand_brands')->where('id', $ordBrand->brand_id)->first();
+                if ($brand && $brand->status) {
+                    return $brand;
+                }
+            }
+        }
+
+        // 3. Fall back to current request domain brand
+        $brand = get_multibrand_active_brand();
+        return $brand;
+    } catch (\Exception $e) {
+        return get_multibrand_active_brand();
+    }
+}
+
+function apply_brand_gateway_overrides($brand)
+{
+    if (!$brand || !$brand->payment_gateways) {
+        return;
+    }
+    
+    $brandGateways = json_decode(htmlspecialchars_decode($brand->payment_gateways), true);
+    if (!is_array($brandGateways) || count($brandGateways) == 0) {
+        return;
+    }
+
+    $originals = [];
+
+    foreach ($brandGateways as $bgw) {
+        if (empty($bgw['status'])) {
+            continue;
+        }
+
+        $gatewayName = $bgw['gateway'];
+        
+        if (!empty($bgw['is_whmcs'])) {
+            continue;
+        }
+
+        try {
+            $settings = Capsule::table('tblpaymentgateways')->where('gateway', $gatewayName)->get();
+            if ($settings->count() > 0) {
+                $originals[$gatewayName] = [];
+                foreach ($settings as $setting) {
+                    $originals[$gatewayName][$setting->setting] = $setting->value;
+                    
+                    $newValue = null;
+                    $sName = strtolower($setting->setting);
+                    
+                    if (in_array($sName, ['clientid', 'client_id', 'client-id'])) {
+                        $newValue = $bgw['client_id'] ?? null;
+                    } elseif (in_array($sName, ['clientsecret', 'client_secret', 'secret', 'secretkey', 'secret_key'])) {
+                        $newValue = $bgw['secret'] ?? null;
+                    } elseif (in_array($sName, ['testmode', 'test_mode', 'sandbox'])) {
+                        if ($setting->value === 'on' || $setting->value === '1' || is_numeric($setting->value)) {
+                            $newValue = !empty($bgw['test_mode']) ? $setting->value : '';
+                        } else {
+                            $newValue = !empty($bgw['test_mode']) ? 'on' : '';
+                        }
+                    } elseif (in_array($sName, ['name', 'friendlyname', 'friendly_name'])) {
+                        $newValue = $bgw['friendly_name'] ?? null;
+                    } elseif (in_array($sName, ['convertto', 'convert_to'])) {
+                        $currencyCode = $bgw['convert_to'] ?? '';
+                        if ($currencyCode) {
+                            $curr = Capsule::table('tblcurrencies')->where('code', $currencyCode)->first();
+                            if ($curr) {
+                                $newValue = $curr->id;
+                            }
+                        }
+                    }
+
+                    if ($newValue !== null) {
+                        Capsule::table('tblpaymentgateways')
+                            ->where('gateway', $gatewayName)
+                            ->where('setting', $setting->setting)
+                            ->update(['value' => $newValue]);
+                    }
+                }
+            }
+        } catch (\Exception $e) {}
+    }
+
+    if (count($originals) > 0) {
+        register_shutdown_function(function() use ($originals) {
+            foreach ($originals as $gwName => $gwSettings) {
+                foreach ($gwSettings as $settingName => $value) {
+                    try {
+                        Capsule::table('tblpaymentgateways')
+                            ->where('gateway', $gwName)
+                            ->where('setting', $settingName)
+                            ->update(['value' => $value]);
+                    } catch (\Exception $e) {}
+                }
+            }
+        });
+    }
+}
+
+// Runtime Execution on Frontend
+if (!defined('ADMIN_AREA')) {
+    try {
+        $requestBrand = get_multibrand_request_brand();
+        if ($requestBrand) {
+            apply_brand_gateway_overrides($requestBrand);
+        }
+    } catch (\Exception $e) {}
+}
+
 
 
 

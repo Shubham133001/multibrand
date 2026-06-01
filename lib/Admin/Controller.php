@@ -45,6 +45,9 @@ class Controller
             'auto_client_assignment' => ['type' => 'boolean', 'default' => 0],
             'tos_url' => ['type' => 'string', 'default' => NULL],
             'signature' => ['type' => 'text', 'default' => NULL],
+            'payment_gateways' => ['type' => 'text', 'default' => NULL],
+            'smtp_settings' => ['type' => 'text', 'default' => NULL],
+            'email_template_settings' => ['type' => 'text', 'default' => NULL],
         ];
 
         foreach ($billingColumns as $col => $info) {
@@ -79,6 +82,23 @@ class Controller
             } catch (\Exception $e) {
                 // Ignore
             }
+        }
+
+        // Dynamically create mod_multibrand_email_templates if it doesn't exist
+        if (!Capsule::schema()->hasTable('mod_multibrand_email_templates')) {
+            try {
+                Capsule::schema()->create('mod_multibrand_email_templates', function ($table) {
+                    $table->increments('id');
+                    $table->integer('brand_id');
+                    $table->string('template_name');
+                    $table->boolean('status')->default(0);
+                    $table->text('copy_to')->nullable();
+                    $table->text('blind_copy_to')->nullable();
+                    $table->text('translations')->nullable();
+                    $table->timestamps();
+                    $table->unique(['brand_id', 'template_name']);
+                });
+            } catch (\Exception $e) {}
         }
 
         $brands = Capsule::table('mod_multibrand_brands')->get();
@@ -409,6 +429,151 @@ class Controller
         try {
             $currencies = Capsule::table('tblcurrencies')->orderBy('code', 'asc')->get();
         } catch (\Exception $e) {}
+
+        // Fetch active payment gateways in WHMCS
+        $whmcsGateways = [];
+        try {
+            $whmcsGateways = Capsule::table('tblpaymentgateways')
+                ->where('setting', 'name')
+                ->orderBy('value', 'asc')
+                ->get();
+        } catch (\Exception $e) {}
+
+        // Parse SMTP and templates values
+        $smtp = json_decode(htmlspecialchars_decode($brand->smtp_settings ?: '{}'), true);
+        $email_templates = json_decode(htmlspecialchars_decode($brand->email_template_settings ?: '{}'), true);
+
+        // Templates variables will be loaded below where brandColor is fully defined
+
+        // Fetch configured brand-specific template entries
+        $brandedMap = [];
+        try {
+            $brandedTemplates = Capsule::table('mod_multibrand_email_templates')->where('brand_id', $brand->id)->get();
+            foreach ($brandedTemplates as $bt) {
+                $translations = json_decode(htmlspecialchars_decode($bt->translations ?: '{}'), true);
+                $isBranded = false;
+                if (!empty($translations)) {
+                    foreach ($translations as $lang => $data) {
+                        if (!empty($data['subject']) || !empty($data['message'])) {
+                            $isBranded = true;
+                            break;
+                        }
+                    }
+                }
+                $brandedMap[$bt->template_name] = [
+                    'status' => (int)$bt->status,
+                    'branded' => $isBranded
+                ];
+            }
+        } catch (\Exception $e) {}
+
+        // Fetch client-facing templates and group them by category for Email Templates tab
+        $allTplRows = [];
+        try {
+            $allTplRows = Capsule::table('tblemailtemplates')
+                ->select('id', 'type', 'name', 'custom')
+                ->orderBy('name', 'asc')
+                ->get();
+        } catch (\Exception $e) {}
+
+        $groupedTemplates = [
+            'general' => [],
+            'product' => [],
+            'domain' => [],
+            'support' => [],
+            'invoice' => []
+        ];
+
+        foreach ($allTplRows as $tpl) {
+            $type = strtolower($tpl->type);
+            if (in_array($type, ['general', 'user', 'invite', 'affiliate', 'notification', 'admin_invite'])) {
+                $groupedTemplates['general'][] = $tpl;
+            } elseif ($type === 'product') {
+                $groupedTemplates['product'][] = $tpl;
+            } elseif ($type === 'domain') {
+                $groupedTemplates['domain'][] = $tpl;
+            } elseif ($type === 'support') {
+                $groupedTemplates['support'][] = $tpl;
+            } elseif ($type === 'invoice') {
+                $groupedTemplates['invoice'][] = $tpl;
+            }
+        }
+
+        // Build category HTML
+        $emailTemplatesHtml = '<h4 style="margin: 0 0 15px 0; font-weight: bold; color: ' . $brandColor . '; text-transform: uppercase; font-size: 1.1em;"><i class="fas fa-envelope" style="margin-right: 8px;"></i> Email Templates</h4>';
+        $emailTemplatesHtml .= '<p style="color: #777; font-size: 0.9em; line-height: 1.5; margin-bottom: 20px;">Manage custom headers, footers, and templates for system emails dispatched by this brand.</p>';
+        
+        // Category sub-tabs headers
+        $emailTemplatesHtml .= '
+        <ul class="nav nav-tabs" id="emailTemplatesCatTabs" style="margin-bottom: 20px; border-bottom: 2px solid #eee; display: flex; gap: 4px;">
+            <li class="active"><a href="#email-cat-general" data-toggle="tab" style="font-weight: 600; padding: 10px 20px; margin-right: 5px;">General</a></li>
+            <li><a href="#email-cat-product" data-toggle="tab" style="font-weight: 600; padding: 10px 20px; margin-right: 5px;">Product</a></li>
+            <li><a href="#email-cat-domain" data-toggle="tab" style="font-weight: 600; padding: 10px 20px; margin-right: 5px;">Domain</a></li>
+            <li><a href="#email-cat-support" data-toggle="tab" style="font-weight: 600; padding: 10px 20px; margin-right: 5px;">Support</a></li>
+            <li><a href="#email-cat-invoice" data-toggle="tab" style="font-weight: 600; padding: 10px 20px; margin-right: 5px;">Invoice</a></li>
+        </ul>';
+
+        $emailTemplatesHtml .= '<div class="tab-content" style="border: none; padding: 0; background: none; box-shadow: none; max-height: 500px; overflow-y: auto;">';
+
+        $catKeys = ['general', 'product', 'domain', 'support', 'invoice'];
+        foreach ($catKeys as $catKey) {
+            $activeClass = ($catKey === 'general') ? 'active' : '';
+            $emailTemplatesHtml .= '<div class="tab-pane ' . $activeClass . '" id="email-cat-' . $catKey . '">';
+            $emailTemplatesHtml .= '<table class="table table-hover" style="width: 100%; border-collapse: collapse; margin-bottom: 0;">';
+            $emailTemplatesHtml .= '<tbody>';
+            
+            if (empty($groupedTemplates[$catKey])) {
+                $emailTemplatesHtml .= '<tr><td colspan="2" class="text-center" style="padding: 20px; color: #999;">No templates available in this category.</td></tr>';
+            } else {
+                foreach ($groupedTemplates[$catKey] as $t) {
+                    $isBranded = false;
+                    $isEnabled = false;
+                    
+                    if (isset($brandedMap[$t->name])) {
+                        $isEnabled = $brandedMap[$t->name]['status'] === 1;
+                        $isBranded = $brandedMap[$t->name]['branded'];
+                    }
+                    
+                    $emailTemplatesHtml .= '<tr>';
+                    $emailTemplatesHtml .= '<td style="padding: 12px 10px; border-bottom: 1px solid #f0f0f0; vertical-align: middle;">';
+                    $emailTemplatesHtml .= '<span style="font-size: 0.95em; font-weight: 600; color: #333;">' . htmlspecialchars($t->name) . '</span>';
+                    if ($isBranded) {
+                        $emailTemplatesHtml .= '<span class="label label-danger" style="background-color: #d9534f; font-size: 0.75em; padding: 2px 6px; border-radius: 3px; font-weight: bold; text-transform: uppercase; margin-left: 8px; color: #fff;">branded</span>';
+                    }
+                    if ($t->custom == 1) {
+                        $emailTemplatesHtml .= '<span class="label label-default" style="background-color: #777; font-size: 0.75em; padding: 2px 6px; border-radius: 3px; font-weight: bold; text-transform: uppercase; margin-left: 8px; color: #fff;">custom</span>';
+                    }
+                    $emailTemplatesHtml .= '</td>';
+                    
+                    $emailTemplatesHtml .= '<td style="padding: 12px 10px; border-bottom: 1px solid #f0f0f0; text-align: right; vertical-align: middle; width: 250px;">';
+                    $emailTemplatesHtml .= '<div style="display: flex; align-items: center; justify-content: flex-end; gap: 15px;">';
+                    $emailTemplatesHtml .= '<button type="button" class="btn btn-primary btn-sm edit-email-template-btn" data-template-name="' . htmlspecialchars($t->name) . '" style="padding: 5px 10px; border-radius: 4px; background: #337ab7; color: #fff; border: 1px solid #2e6da4;" title="Edit Template">';
+                    $emailTemplatesHtml .= '<i class="fas fa-edit"></i>';
+                    $emailTemplatesHtml .= '</button>';
+                    
+                    $emailTemplatesHtml .= '<label class="mb-switch" style="margin-bottom: 0;">';
+                    $emailTemplatesHtml .= '<input type="checkbox" class="email-template-toggle" name="email_template_status[' . htmlspecialchars($t->name) . ']" value="1" ' . ($isEnabled ? 'checked' : '') . ' onchange="var span = this.parentElement.nextElementSibling; span.textContent = this.checked ? \'Enabled\' : \'Disabled\'; span.className = this.checked ? \'label label-success\' : \'label label-default\';">';
+                    $emailTemplatesHtml .= '<span class="mb-slider"></span>';
+                    $emailTemplatesHtml .= '</label>';
+                    $emailTemplatesHtml .= '<span class="label ' . ($isEnabled ? 'label-success' : 'label-default') . '" style="display: inline-block; width: 65px; text-align: center; font-size: 0.85em; padding: 4px 0; border-radius: 3px; font-weight: 600;">' . ($isEnabled ? 'Enabled' : 'Disabled') . '</span>';
+                    $emailTemplatesHtml .= '</div>';
+                    $emailTemplatesHtml .= '</td>';
+                    $emailTemplatesHtml .= '</tr>';
+                }
+            }
+            
+            $emailTemplatesHtml .= '</tbody>';
+            $emailTemplatesHtml .= '</table>';
+            $emailTemplatesHtml .= '</div>';
+        }
+        
+        $emailTemplatesHtml .= '</div>';
+        
+        // Add save configuration button at the bottom of the templates list
+        $emailTemplatesHtml .= '
+        <div style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #eee; text-align: right;">
+            <button type="submit" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; font-weight: bold; padding: 8px 20px; font-size: 0.95em;"><i class="fas fa-save" style="margin-right: 6px;"></i> Save Configuration</button>
+        </div>';
 
         // Fetch all WHMCS clients for the Assign Client modal dropdown
         $allClients = [];
@@ -1027,7 +1192,7 @@ class Controller
             </div>
         </div>
 
-        <form method="post" action="' . $modulelink . '&action=save" enctype="multipart/form-data">
+        <form method="post" action="' . $modulelink . '&action=save" enctype="multipart/form-data" novalidate>
             <input type="hidden" name="id" value="' . $brand->id . '">
             <input type="hidden" name="status_submitted" value="1">
             
@@ -1512,34 +1677,542 @@ class Controller
                             <!-- PAYMENT GATEWAYS TAB -->
                             <div class="tab-pane" id="set-gateways">
                                 <h4 style="margin: 0 0 15px 0; font-weight: bold; color: ' . $brandColor . '; text-transform: uppercase; font-size: 1.1em;"><i class="fas fa-credit-card" style="margin-right: 8px;"></i> Payment Gateways</h4>
-                                <p style="color: #777; font-size: 0.9em; line-height: 1.5; margin-bottom: 20px;">Configure brand-specific payment gateway credentials and override standard gateway configurations.</p>
-                                <div style="border: 1px solid #e2e2e2; border-radius: 6px; padding: 25px; background: #fafafa; text-align: center;">
-                                    <i class="fas fa-plug" style="font-size: 2.5em; color: #ccc; margin-bottom: 12px;"></i>
-                                    <div style="font-weight: 600; color: #555; font-size: 1em; margin-bottom: 5px;">Payment Gateways Overrides</div>
-                                    <div style="font-size: 0.85em; color: #888;">Configure merchant credentials specific to this brand for PayPal, Stripe, and other gateways.</div>
+                                <textarea name="payment_gateways" id="payment_gateways_json" style="display:none;">' . htmlspecialchars(htmlspecialchars_decode($brand->payment_gateways ?: '[]')) . '</textarea>
+                                
+                                <div style="border: 1px solid #e2e2e2; border-radius: 6px; background: #fff; overflow: hidden; font-family: \'Outfit\', sans-serif;">
+                                    <div style="background: #f7f7f7; border-bottom: 1px solid #e2e2e2; padding: 10px 15px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+                                        <div id="brand_gateway_tabs" style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;"></div>
+                                        <button type="button" class="btn btn-default btn-sm" data-toggle="modal" data-target="#modal-add-brand-gateway" style="border-radius: 50%; width: 32px; height: 32px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 1.1em; border: 1px solid #ccc; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.05); color: #555; transition: all 0.2s;" onmouseover="this.style.background=\'#eee\';" onmouseout="this.style.background=\'#fff\';">
+                                            <i class="fas fa-plus"></i>
+                                        </button>
+                                    </div>
+                                    <div id="brand_gateway_config_panel" style="padding: 25px; min-height: 250px;"></div>
                                 </div>
+                                
+                                <script>
+                                (function() {
+                                    var gatewaysTextarea = document.getElementById("payment_gateways_json");
+                                    var activeTab = "";
+                                    var gateways = [];
+                                    var currencies = ' . json_encode($currencies) . ';
+                                    var brandColor = "' . $brandColor . '";
+
+                                    try {
+                                        gateways = JSON.parse(gatewaysTextarea.value || "[]");
+                                    } catch(e) {
+                                        gateways = [];
+                                    }
+
+                                    if (!Array.isArray(gateways)) {
+                                        gateways = [];
+                                    }
+
+                                    if (gateways.length > 0) {
+                                        activeTab = gateways[0].gateway;
+                                    }
+
+                                    function saveState() {
+                                        gatewaysTextarea.value = JSON.stringify(gateways);
+                                    }
+
+                                    function renderTabs() {
+                                        var tabsContainer = document.getElementById("brand_gateway_tabs");
+                                        tabsContainer.innerHTML = "";
+
+                                        if (gateways.length === 0) {
+                                            tabsContainer.innerHTML = "<span style=\"color: #888; font-style: italic; font-size: 0.9em;\">No gateways added yet. Click the + button to add one.</span>";
+                                            return;
+                                        }
+
+                                        gateways.forEach(function(gw, index) {
+                                            var isActive = (gw.gateway === activeTab);
+                                            var tabEl = document.createElement("div");
+                                            tabEl.className = "gateway-tab" + (isActive ? " active" : "");
+                                            
+                                            tabEl.style.display = "inline-flex";
+                                            tabEl.style.alignItems = "center";
+                                            tabEl.style.gap = "6px";
+                                            tabEl.style.padding = "6px 12px";
+                                            tabEl.style.borderRadius = "4px";
+                                            tabEl.style.background = isActive ? "#fff" : "#f0f0f0";
+                                            tabEl.style.border = "1px solid " + (isActive ? "#dcdcdc" : "#e0e0e0");
+                                            tabEl.style.borderBottom = isActive ? "2px solid " + brandColor : "1px solid #e0e0e0";
+                                            tabEl.style.cursor = "pointer";
+                                            tabEl.style.fontWeight = "600";
+                                            tabEl.style.fontSize = "0.88em";
+                                            tabEl.style.color = isActive ? "#333" : "#666";
+                                            tabEl.style.transition = "all 0.15s";
+
+                                            var dragHandle = document.createElement("span");
+                                            dragHandle.innerHTML = "⠿";
+                                            dragHandle.style.cursor = "move";
+                                            dragHandle.style.color = "#aaa";
+                                            dragHandle.style.fontSize = "1em";
+                                            dragHandle.title = "Reorder";
+                                            tabEl.appendChild(dragHandle);
+
+                                            var nameSpan = document.createElement("span");
+                                            var displayName = gw.friendly_name || gw.gateway;
+                                            if (gw.is_whmcs) {
+                                                displayName += " [WHMCS]";
+                                            }
+                                            nameSpan.innerText = displayName;
+                                            tabEl.appendChild(nameSpan);
+
+                                            var deleteBtn = document.createElement("span");
+                                            deleteBtn.innerHTML = "&times;";
+                                            deleteBtn.style.color = "#999";
+                                            deleteBtn.style.fontSize = "1.2em";
+                                            deleteBtn.style.fontWeight = "bold";
+                                            deleteBtn.style.cursor = "pointer";
+                                            deleteBtn.style.lineHeight = "1";
+                                            deleteBtn.style.marginLeft = "4px";
+                                            deleteBtn.style.display = "inline-block";
+                                            deleteBtn.title = "Remove";
+                                            deleteBtn.onmouseover = function() { this.style.color = "#d9534f"; };
+                                            deleteBtn.onmouseout = function() { this.style.color = "#999"; };
+                                            
+                                            deleteBtn.onclick = function(e) {
+                                                e.stopPropagation();
+                                                if (confirm("Are you sure you want to remove this payment gateway config?")) {
+                                                    removeGateway(gw.gateway);
+                                                }
+                                            };
+                                            tabEl.appendChild(deleteBtn);
+
+                                            tabEl.onclick = function() {
+                                                activeTab = gw.gateway;
+                                                render();
+                                            };
+
+                                            tabEl.draggable = true;
+                                            tabEl.ondragstart = function(e) {
+                                                e.dataTransfer.setData("text/plain", index);
+                                            };
+                                            tabEl.ondragover = function(e) {
+                                                e.preventDefault();
+                                            };
+                                            tabEl.ondrop = function(e) {
+                                                e.preventDefault();
+                                                var fromIndex = parseInt(e.dataTransfer.getData("text/plain"), 10);
+                                                var toIndex = index;
+                                                if (fromIndex !== toIndex) {
+                                                    var movedGw = gateways.splice(fromIndex, 1)[0];
+                                                    gateways.splice(toIndex, 0, movedGw);
+                                                    saveState();
+                                                    render();
+                                                }
+                                            };
+
+                                            tabsContainer.appendChild(tabEl);
+                                        });
+                                    }
+
+                                    function removeGateway(gwName) {
+                                        gateways = gateways.filter(function(gw) {
+                                            return gw.gateway !== gwName;
+                                        });
+                                        if (activeTab === gwName) {
+                                            activeTab = gateways.length > 0 ? gateways[0].gateway : "";
+                                        }
+                                        saveState();
+                                        render();
+                                    }
+
+                                    function renderConfigPanel() {
+                                        var panel = document.getElementById("brand_gateway_config_panel");
+                                        panel.innerHTML = "";
+
+                                        if (gateways.length === 0) {
+                                            panel.innerHTML = "<div style=\"border: 1px solid #e2e2e2; border-radius: 6px; padding: 40px 25px; background: #fafafa; text-align: center; color: #888;\"><i class=\"fas fa-credit-card\" style=\"font-size: 3em; color: #ccc; margin-bottom: 15px;\"></i><div style=\"font-weight: 600; color: #555; font-size: 1.1em; margin-bottom: 5px;\">No Branded Payment Gateways</div><div style=\"font-size: 0.9em; max-width: 450px; margin: 0 auto 15px auto;\">Configure merchant credentials specific to this brand for PayPal, Stripe, and other gateways by clicking the add button in the top right.</div></div>";
+                                            return;
+                                        }
+
+                                        var gw = gateways.find(function(g) { return g.gateway === activeTab; });
+                                        if (!gw) {
+                                            if (gateways.length > 0) {
+                                                activeTab = gateways[0].gateway;
+                                                gw = gateways[0];
+                                            } else {
+                                                return;
+                                            }
+                                        }
+
+                                        var formContainer = document.createElement("div");
+                                        formContainer.style.display = "flex";
+                                        formContainer.style.flexDirection = "column";
+                                        formContainer.style.gap = "20px";
+
+                                        var statusRow = document.createElement("div");
+                                        statusRow.style.display = "flex";
+                                        statusRow.style.alignItems = "flex-start";
+                                        statusRow.style.gap = "15px";
+                                        
+                                        var isChecked = gw.status ? "checked" : "";
+                                        var badgeText = gw.status ? "Enabled" : "Disabled";
+                                        var badgeColor = gw.status ? "#5cb85c" : "#777";
+
+                                        statusRow.innerHTML = "<label class=\"mb-switch\" style=\"flex-shrink: 0; margin: 0;\"><input type=\"checkbox\" id=\"gw_status_chk\" " + isChecked + "><span class=\"mb-slider\"></span></label><div style=\"display: flex; flex-direction: column; gap: 4px;\"><div style=\"display: flex; align-items: center; gap: 8px;\"><span style=\"font-weight: 600; color: #444; font-size: 1em;\">Status</span><span id=\"gw_status_badge\" class=\"status-badge\" style=\"background-color: " + badgeColor + "; color: #fff; font-size: 0.72em; padding: 2px 8px; border-radius: 3px; font-weight: bold; text-transform: uppercase;\">" + badgeText + "</span></div><span style=\"font-size: 0.85em; color: #777;\">The status of the gateway.</span></div>";
+                                        formContainer.appendChild(statusRow);
+
+                                        var statusChk = statusRow.querySelector("#gw_status_chk");
+                                        statusChk.onchange = function() {
+                                            gw.status = this.checked ? 1 : 0;
+                                            var badge = statusRow.querySelector("#gw_status_badge");
+                                            badge.textContent = gw.status ? "Enabled" : "Disabled";
+                                            badge.style.backgroundColor = gw.status ? "#5cb85c" : "#777";
+                                            saveState();
+                                        };
+
+                                        if (gw.is_whmcs) {
+                                            var alertsContainer = document.createElement("div");
+                                            alertsContainer.style.display = "flex";
+                                            alertsContainer.style.flexDirection = "column";
+                                            alertsContainer.style.gap = "12px";
+                                            alertsContainer.style.marginTop = "10px";
+
+                                            alertsContainer.innerHTML = "<div class=\"alert alert-danger\" style=\"background-color: #f2dede; border-color: #ebccd1; color: #a94442; padding: 12px 15px; border-radius: 4px; font-size: 0.9em; margin: 0; font-weight: 600;\"><i class=\"fas fa-exclamation-triangle\" style=\"margin-right: 8px;\"></i> IMPORTANT: This gateway will not be branded in any way!</div><div class=\"alert alert-info\" style=\"background-color: #d9edf7; border-color: #bce8f1; color: #31708f; padding: 12px 15px; border-radius: 4px; font-size: 0.9em; margin: 0;\"><i class=\"fas fa-info-circle\" style=\"margin-right: 8px;\"></i> Please note: this is the WHMCS gateway and it can be configured only in Setup &rarr; Payments &rarr; Payment Gateways.</div>";
+                                            formContainer.appendChild(alertsContainer);
+                                        } else {
+                                            var fieldsGrid = document.createElement("div");
+                                            fieldsGrid.style.display = "flex";
+                                            fieldsGrid.style.flexDirection = "column";
+                                            fieldsGrid.style.gap = "15px";
+                                            fieldsGrid.style.maxWidth = "600px";
+
+                                            var friendlyNameGroup = document.createElement("div");
+                                            friendlyNameGroup.className = "form-group-mb";
+                                            friendlyNameGroup.innerHTML = "<label style=\"font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;\">Friendly Name</label><input type=\"text\" id=\"gw_friendly_name\" class=\"form-control\" value=\"" + (gw.friendly_name || "") + "\"><small class=\"text-muted\" style=\"color: #888; font-size: 0.82em; display: block; margin-top: 4px;\">The gateway name that will be displayed in the cart.</small>";
+                                            fieldsGrid.appendChild(friendlyNameGroup);
+
+                                            friendlyNameGroup.querySelector("#gw_friendly_name").oninput = function() {
+                                                gw.friendly_name = this.value;
+                                                saveState();
+                                                renderTabs();
+                                            };
+
+                                            var convertToGroup = document.createElement("div");
+                                            convertToGroup.className = "form-group-mb";
+                                            
+                                            var optionsHtml = "<option value=\"\">None</option>";
+                                            currencies.forEach(function(curr) {
+                                                var selected = (gw.convert_to === curr.code) ? "selected" : "";
+                                                optionsHtml += "<option value=\"" + curr.code + "\" " + selected + ">" + curr.code + "</option>";
+                                            });
+
+                                            convertToGroup.innerHTML = "<label style=\"font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;\">Convert To</label><select id=\"gw_convert_to\" class=\"form-control\" style=\"height: 36px;\">" + optionsHtml + "</select><small class=\"text-muted\" style=\"color: #888; font-size: 0.82em; display: block; margin-top: 4px;\">This option is used for multiple currencies. This will use the rates set in Setup &rarr; Payments &rarr; Currencies to do the conversion.</small>";
+                                            fieldsGrid.appendChild(convertToGroup);
+
+                                            convertToGroup.querySelector("#gw_convert_to").onchange = function() {
+                                                gw.convert_to = this.value;
+                                                saveState();
+                                            };
+
+                                            var clientIdGroup = document.createElement("div");
+                                            clientIdGroup.className = "form-group-mb";
+                                            clientIdGroup.innerHTML = "<label style=\"font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;\">Client ID</label><input type=\"text\" id=\"gw_client_id\" class=\"form-control\" value=\"" + (gw.client_id || "") + "\"><small class=\"text-muted\" style=\"color: #888; font-size: 0.82em; display: block; margin-top: 4px;\">Provide the client ID from REST API Application.</small>";
+                                            fieldsGrid.appendChild(clientIdGroup);
+                                            clientIdGroup.querySelector("#gw_client_id").oninput = function() {
+                                                gw.client_id = this.value;
+                                                saveState();
+                                            };
+
+                                            var secretGroup = document.createElement("div");
+                                            secretGroup.className = "form-group-mb";
+                                            secretGroup.innerHTML = "<label style=\"font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;\">Secret</label><input type=\"password\" id=\"gw_secret\" class=\"form-control\" value=\"" + (gw.secret || "") + "\" style=\"letter-spacing: 2px;\"><small class=\"text-muted\" style=\"color: #888; font-size: 0.82em; display: block; margin-top: 4px;\">Provide the secret from REST API Application.</small>";
+                                            fieldsGrid.appendChild(secretGroup);
+                                            secretGroup.querySelector("#gw_secret").oninput = function() {
+                                                gw.secret = this.value;
+                                                saveState();
+                                            };
+
+                                            var testModeRow = document.createElement("div");
+                                            testModeRow.style.display = "flex";
+                                            testModeRow.style.alignItems = "flex-start";
+                                            testModeRow.style.gap = "15px";
+                                            testModeRow.style.marginTop = "10px";
+                                            
+                                            var isTestChecked = gw.test_mode ? "checked" : "";
+                                            var testBadgeText = gw.test_mode ? "Enabled" : "Disabled";
+                                            var testBadgeColor = gw.test_mode ? "#f0ad4e" : "#777";
+
+                                            testModeRow.innerHTML = "<label class=\"mb-switch\" style=\"flex-shrink: 0; margin: 0;\"><input type=\"checkbox\" id=\"gw_test_mode_chk\" " + isTestChecked + "><span class=\"mb-slider\"></span></label><div style=\"display: flex; flex-direction: column; gap: 4px;\"><div style=\"display: flex; align-items: center; gap: 8px;\"><span style=\"font-weight: 600; color: #444; font-size: 1em;\">Test Mode</span><span id=\"gw_test_badge\" class=\"status-badge\" style=\"background-color: " + testBadgeColor + "; color: #fff; font-size: 0.72em; padding: 2px 8px; border-radius: 3px; font-weight: bold; text-transform: uppercase;\">" + testBadgeText + "</span></div><span style=\"font-size: 0.85em; color: #777;\">Use this option if you want to use the PayPal sandbox API.</span></div>";
+                                            fieldsGrid.appendChild(testModeRow);
+
+                                            var testModeChk = testModeRow.querySelector("#gw_test_mode_chk");
+                                            testModeChk.onchange = function() {
+                                                gw.test_mode = this.checked ? 1 : 0;
+                                                var badge = testModeRow.querySelector("#gw_test_badge");
+                                                badge.textContent = gw.test_mode ? "Enabled" : "Disabled";
+                                                badge.style.backgroundColor = gw.test_mode ? "#f0ad4e" : "#777";
+                                                saveState();
+                                            };
+
+                                            formContainer.appendChild(fieldsGrid);
+                                        }
+
+                                        panel.appendChild(formContainer);
+                                    }
+
+                                    function render() {
+                                        renderTabs();
+                                        renderConfigPanel();
+                                    }
+
+                                    window.addEventListener("load", function() {
+                                        var btnConfirm = document.getElementById("btn_confirm_add_gateway");
+                                        if (btnConfirm) {
+                                            btnConfirm.onclick = function() {
+                                                var select = document.getElementById("add_brand_gateway_select");
+                                                var val = select.value;
+                                                if (!val) {
+                                                    alert("Please select a gateway!");
+                                                    return;
+                                                }
+
+                                                var exists = gateways.some(function(g) { return g.gateway === val; });
+                                                if (exists) {
+                                                    alert("This gateway is already configured on this brand!");
+                                                    return;
+                                                }
+
+                                                var opt = select.options[select.selectedIndex];
+                                                var isWhmcs = opt.getAttribute("data-whmcs") === "true";
+
+                                                var newGw = {
+                                                    gateway: val,
+                                                    friendly_name: opt.text.replace(" (WHMCS)", ""),
+                                                    status: 1,
+                                                    is_whmcs: isWhmcs
+                                                };
+
+                                                if (!isWhmcs) {
+                                                    newGw.convert_to = "";
+                                                    newGw.client_id = "";
+                                                    newGw.secret = "";
+                                                    newGw.test_mode = 0;
+                                                }
+
+                                                gateways.push(newGw);
+                                                activeTab = val;
+                                                
+                                                saveState();
+                                                render();
+
+                                                jQuery("#modal-add-brand-gateway").modal("hide");
+                                                select.value = "";
+                                            };
+                                        }
+                                    });
+
+                                    render();
+                                })();
+                                </script>
                             </div>
                             
                             <!-- SMTP TAB -->
                             <div class="tab-pane" id="set-smtp">
                                 <h4 style="margin: 0 0 15px 0; font-weight: bold; color: ' . $brandColor . '; text-transform: uppercase; font-size: 1.1em;"><i class="fas fa-paper-plane" style="margin-right: 8px;"></i> SMTP Configuration</h4>
-                                <p style="color: #777; font-size: 0.9em; line-height: 1.5; margin-bottom: 20px;">Set up a custom outgoing mail server for emails sent under this brand\'s domain name.</p>
-                                <div style="border: 1px solid #e2e2e2; border-radius: 6px; padding: 25px; background: #fafafa; text-align: center;">
-                                    <i class="fas fa-envelope-open-text" style="font-size: 2.5em; color: #ccc; margin-bottom: 12px;"></i>
-                                    <div style="font-weight: 600; color: #555; font-size: 1em; margin-bottom: 5px;">SMTP Server Branding</div>
-                                    <div style="font-size: 0.85em; color: #888;">Allows mail delivery using dedicated SMTP credentials (Host, Port, Username, Password, SSL/TLS).</div>
+                                <p style="color: #777; font-size: 0.9em; line-height: 1.5; margin-bottom: 25px;">
+                                    If you would like your brand to use an outgoing email configuration which is different from the one in the main WHMCS settings, you can do it here.<br>
+                                    In addition, you can set your custom CSS email styling as well as the header and footer content.
+                                </p>
+
+                                <div style="display: flex; flex-wrap: wrap; gap: 25px; margin-bottom: 25px; font-family: \'Outfit\', sans-serif;">
+                                    <!-- Left Column -->
+                                    <div style="flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 15px;">
+                                        <!-- Override switch -->
+                                        <div style="display: flex; align-items: flex-start; gap: 15px;">
+                                            <label class="mb-switch" style="flex-shrink: 0; margin: 0;">
+                                                <input type="checkbox" name="smtp_override" value="1" ' . (!empty($smtp['override']) ? 'checked' : '') . '>
+                                                <span class="mb-slider"></span>
+                                            </label>
+                                            <div style="display: flex; flex-direction: column; gap: 4px;">
+                                                <span style="font-weight: 600; color: #444; font-size: 0.95em;">Override</span>
+                                                <span style="font-size: 0.82em; color: #777; line-height: 1.4;">Enable this option to use the brand SMTP configuration. Otherwise the module will use the WHMCS settings.</span>
+                                            </div>
+                                        </div>
+
+                                        <!-- Port input -->
+                                        <div class="form-group-mb">
+                                            <label style="font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;">Port</label>
+                                            <input type="text" name="smtp_port" class="form-control" value="' . htmlspecialchars($smtp['port'] ?? '') . '" placeholder="e.g. 465" style="width: 100%; height: 36px; padding: 6px 12px; font-size: 0.95em;">
+                                            <small class="text-muted" style="color: #888; font-size: 0.82em; display: block; margin-top: 4px;">Specify a port that your SMTP server operates on.</small>
+                                        </div>
+
+                                        <!-- Hostname input -->
+                                        <div class="form-group-mb">
+                                            <label style="font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;">Hostname</label>
+                                            <input type="text" name="smtp_hostname" class="form-control" value="' . htmlspecialchars($smtp['hostname'] ?? '') . '" placeholder="e.g. mail.mailbox.com" style="width: 100%; height: 36px; padding: 6px 12px; font-size: 0.95em;">
+                                            <small class="text-muted" style="color: #888; font-size: 0.82em; display: block; margin-top: 4px;">Provide the SMTP server hostname.</small>
+                                        </div>
+
+                                        <!-- Username input -->
+                                        <div class="form-group-mb">
+                                            <label style="font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;">Username</label>
+                                            <input type="text" name="smtp_username" class="form-control" value="' . htmlspecialchars($smtp['username'] ?? '') . '" placeholder="e.g. test@mailbox.com" style="width: 100%; height: 36px; padding: 6px 12px; font-size: 0.95em;">
+                                            <small class="text-muted" style="color: #888; font-size: 0.82em; display: block; margin-top: 4px;">Specify a username that should be used to connect with the SMTP server.</small>
+                                        </div>
+
+                                        <!-- Test Connection button -->
+                                        <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 5px;">
+                                            <span style="font-weight: bold; color: #555; font-size: 0.92em;">Test Connection</span>
+                                            <button type="button" id="btn_test_smtp" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; padding: 7px 20px; font-weight: 600; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; align-self: flex-start; min-width: 155px;">
+                                                <i class="fas fa-plug"></i> Test Connection
+                                            </button>
+                                            <span style="font-size: 0.82em; color: #777; line-height: 1.4;">An email is sent to the email address of the currently logged in administrator.</span>
+                                            <div id="smtp_test_result" style="display: none; margin-top: 5px;"></div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Right Column -->
+                                    <div style="flex: 1; min-width: 280px; display: flex; flex-direction: column; gap: 15px;">
+                                        <!-- SMTP Debug switch -->
+                                        <div style="display: flex; align-items: flex-start; gap: 15px;">
+                                            <label class="mb-switch" style="flex-shrink: 0; margin: 0;">
+                                                <input type="checkbox" name="smtp_debug" value="1" ' . (!empty($smtp['debug']) ? 'checked' : '') . '>
+                                                <span class="mb-slider"></span>
+                                            </label>
+                                            <div style="display: flex; flex-direction: column; gap: 4px;">
+                                                <span style="font-weight: 600; color: #444; font-size: 0.95em;">SMTP Debug</span>
+                                                <span style="font-size: 0.82em; color: #777; line-height: 1.4;">Enable this option to log SMTP connection details.</span>
+                                            </div>
+                                        </div>
+
+                                        <!-- Mail Type select -->
+                                        <div class="form-group-mb">
+                                            <label style="font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;">Mail Type</label>
+                                            <select name="smtp_mail_type" class="form-control" style="width: 100%; height: 36px; padding: 6px 12px; font-size: 0.95em;">
+                                                <option value="SMTP" ' . (($smtp['mail_type'] ?? 'SMTP') === 'SMTP' ? 'selected' : '') . '>SMTP</option>
+                                                <option value="mail" ' . (($smtp['mail_type'] ?? '') === 'mail' ? 'selected' : '') . '>PHP Mail</option>
+                                            </select>
+                                            <small class="text-muted" style="color: #888; font-size: 0.82em; display: block; margin-top: 4px;">Choose how your system should send emails.</small>
+                                        </div>
+
+                                        <!-- SMTP SSL Type select -->
+                                        <div class="form-group-mb">
+                                            <label style="font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;">SMTP SSL Type</label>
+                                            <select name="smtp_ssl_type" class="form-control" style="width: 100%; height: 36px; padding: 6px 12px; font-size: 0.95em;">
+                                                <option value="" ' . (empty($smtp['ssl_type']) ? 'selected' : '') . '>None</option>
+                                                <option value="SSL" ' . (($smtp['ssl_type'] ?? '') === 'SSL' ? 'selected' : '') . '>SSL</option>
+                                                <option value="TLS" ' . (($smtp['ssl_type'] ?? '') === 'TLS' ? 'selected' : '') . '>TLS</option>
+                                            </select>
+                                            <small class="text-muted" style="color: #888; font-size: 0.82em; display: block; margin-top: 4px;">Specify whether to use the secure connection when communicating with your mail server.</small>
+                                        </div>
+
+                                        <!-- Password input -->
+                                        <div class="form-group-mb">
+                                            <label style="font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;">Password</label>
+                                            <input type="password" name="smtp_password" class="form-control" value="' . htmlspecialchars($smtp['password'] ?? '') . '" placeholder="••••••••" style="width: 100%; height: 36px; padding: 6px 12px; font-size: 0.95em; letter-spacing: 2px;">
+                                            <small class="text-muted" style="color: #888; font-size: 0.82em; display: block; margin-top: 4px;">Provide a user password required to connect with the SMTP server.</small>
+                                        </div>
+
+                                        <!-- Disable Email switch -->
+                                        <div style="display: flex; align-items: flex-start; gap: 15px; margin-top: 5px;">
+                                            <label class="mb-switch" style="flex-shrink: 0; margin: 0;">
+                                                <input type="checkbox" name="smtp_disable_email" value="1" ' . (!empty($smtp['disable_email']) ? 'checked' : '') . '>
+                                                <span class="mb-slider"></span>
+                                            </label>
+                                            <div style="display: flex; flex-direction: column; gap: 4px;">
+                                                <span style="font-weight: 600; color: #444; font-size: 0.95em;">Disable Email</span>
+                                                <span style="font-size: 0.82em; color: #777; line-height: 1.4;">Enable if you wish to switch off outgoing email messages.</span>
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
+
+                                <div style="border-top: 1px solid #eee; padding-top: 25px; display: flex; flex-direction: column; gap: 20px; font-family: \'Outfit\', sans-serif;">
+                                    <!-- CSS Email Styling -->
+                                    <div class="form-group-mb">
+                                        <label style="font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;">CSS Email Styling</label>
+                                        <textarea name="css_email_styling" rows="4" class="form-control" style="width: 100%; font-family: monospace; font-size: 0.9em; line-height: 1.4; padding: 8px;">' . htmlspecialchars($email_templates['css'] ?? '') . '</textarea>
+                                    </div>
+
+                                    <!-- Email Header Content -->
+                                    <div class="form-group-mb">
+                                        <label style="font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;">Email Header Content</label>
+                                        <textarea name="email_header_content" rows="6" class="form-control" style="width: 100%; font-family: monospace; font-size: 0.9em; line-height: 1.4; padding: 8px;">' . htmlspecialchars($email_templates['header'] ?? '') . '</textarea>
+                                    </div>
+
+                                    <!-- Email Footer Content -->
+                                    <div class="form-group-mb">
+                                        <label style="font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;">Email Footer Content</label>
+                                        <textarea name="email_footer_content" rows="6" class="form-control" style="width: 100%; font-family: monospace; font-size: 0.9em; line-height: 1.4; padding: 8px;">' . htmlspecialchars($email_templates['footer'] ?? '') . '</textarea>
+                                    </div>
+                                </div>
+
+                                <div style="margin-top: 30px; border: 1px solid #e2e2e2; border-radius: 6px; background: #fafafa; padding: 20px; font-family: \'Outfit\', sans-serif;">
+                                    <h5 style="margin: 0 0 12px 0; font-weight: bold; color: #333; font-size: 0.95em;"><i class="fas fa-info-circle" style="margin-right: 6px; color: #007bff;"></i> Merge Fields Information</h5>
+                                    <p style="color: #666; font-size: 0.88em; line-height: 1.4; margin-bottom: 15px;">
+                                        Please remember that the following merge fields can be used for <strong>\'Email Header Content\'</strong> as well as <strong>\'Email Footer Content\'</strong>:
+                                    </p>
+                                    
+                                    <div style="overflow-x: auto;">
+                                        <table class="table table-bordered table-condensed" style="background: #fff; font-size: 0.85em; margin: 0; min-width: 400px; border-color: #ddd;">
+                                            <thead>
+                                                <tr style="background: #f1f1f1;">
+                                                    <th style="font-weight: bold; color: #444; width: 50%;">Description</th>
+                                                    <th style="font-weight: bold; color: #444; width: 50%;">Merge Field Tag</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <tr><td>Company Name</td><td><code>{$company_name}</code></td></tr>
+                                                <tr><td>Domain</td><td><code>{$company_domain}</code></td></tr>
+                                                <tr><td>Logo URL</td><td><code>{$company_logo_url}</code></td></tr>
+                                                <tr><td>WHMCS URL</td><td><code>{$whmcs_url}</code></td></tr>
+                                                <tr><td>WHMCS Link</td><td><code>{$whmcs_link}</code></td></tr>
+                                                <tr><td>Marketing Unsubscribe URL</td><td><code>{$unsubscribe_url}</code></td></tr>
+                                                <tr><td>Marketing Optout URL</td><td><code>{$email_marketing_optout_url}</code></td></tr>
+                                                <tr><td>Marketing Optin URL</td><td><code>{$email_marketing_optin_url}</code></td></tr>
+                                                <tr><td>Signature</td><td><code>{$signature}</code></td></tr>
+                                                <tr><td>Full Sending Date</td><td><code>{$date}</code></td></tr>
+                                                <tr><td>Full Sending Time</td><td><code>{$time}</code></td></tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+
+                                <script>
+                                (function() {
+                                    var btn = document.getElementById("btn_test_smtp");
+                                    if (btn) {
+                                        btn.onclick = function() {
+                                            var resultDiv = document.getElementById("smtp_test_result");
+                                            resultDiv.style.display = "block";
+                                            resultDiv.innerHTML = "<div class=\'alert alert-warning\' style=\'margin: 0; padding: 8px 12px; font-size: 0.85em;\'><i class=\'fas fa-spinner fa-spin\'></i> Testing SMTP connection...</div>";
+                                            
+                                            var hostname = document.getElementsByName("smtp_hostname")[0].value;
+                                            var port = document.getElementsByName("smtp_port")[0].value;
+                                            var username = document.getElementsByName("smtp_username")[0].value;
+                                            var password = document.getElementsByName("smtp_password")[0].value;
+                                            var sslType = document.getElementsByName("smtp_ssl_type")[0].value;
+                                            var mailType = document.getElementsByName("smtp_mail_type")[0].value;
+
+                                            jQuery.post("' . $modulelink . '&action=test_smtp_connection", {
+                                                hostname: hostname,
+                                                port: port,
+                                                username: username,
+                                                password: password,
+                                                ssl_type: sslType,
+                                                mail_type: mailType
+                                            }, function(res) {
+                                                if (res.success) {
+                                                    resultDiv.innerHTML = "<div class=\'alert alert-success\' style=\'margin: 0; padding: 8px 12px; font-size: 0.85em;\'><i class=\'fas fa-check-circle\'></i> " + res.message + "</div>";
+                                                } else {
+                                                    resultDiv.innerHTML = "<div class=\'alert alert-danger\' style=\'margin: 0; padding: 8px 12px; font-size: 0.85em;\'><i class=\'fas fa-exclamation-circle\'></i> " + res.message + "</div>";
+                                                }
+                                            }, "json").fail(function() {
+                                                resultDiv.innerHTML = "<div class=\'alert alert-danger\' style=\'margin: 0; padding: 8px 12px; font-size: 0.85em;\'><i class=\'fas fa-exclamation-circle\'></i> AJAX request failed. Make sure your server is reachable.</div>";
+                                            });
+                                        };
+                                    }
+                                })();
+                                </script>
                             </div>
                             
                             <!-- EMAIL TEMPLATES TAB -->
                             <div class="tab-pane" id="set-emails">
-                                <h4 style="margin: 0 0 15px 0; font-weight: bold; color: ' . $brandColor . '; text-transform: uppercase; font-size: 1.1em;"><i class="fas fa-envelope" style="margin-right: 8px;"></i> Email Templates</h4>
-                                <p style="color: #777; font-size: 0.9em; line-height: 1.5; margin-bottom: 20px;">Manage custom headers, footers, and templates for system emails dispatched by this brand.</p>
-                                <div style="border: 1px solid #e2e2e2; border-radius: 6px; padding: 25px; background: #fafafa; text-align: center;">
-                                    <i class="fas fa-paint-brush" style="font-size: 2.5em; color: #ccc; margin-bottom: 12px;"></i>
-                                    <div style="font-weight: 600; color: #555; font-size: 1em; margin-bottom: 5px;">Email Template Branding</div>
-                                    <div style="font-size: 0.85em; color: #888;">Define dedicated wrappers, logos, and signatures for customer communications.</div>
-                                </div>
+                                ' . $emailTemplatesHtml . '
                             </div>
                             
                             <!-- MAINTENANCE TAB -->
@@ -1569,13 +2242,216 @@ class Controller
                         </div>
                         
                         <div style="padding: 15px 25px; background: #fafafa; border-top: 1px solid #f0f0f0; text-align: right;">
-                            <button type="submit" class="btn btn-success" style="padding: 7px 25px; font-weight: 600; border-radius: 4px;"><i class="fas fa-save" style="margin-right: 6px;"></i> Save Changes</button>
+                                        <button type="submit" class="btn btn-success" style="padding: 7px 25px; font-weight: 600; border-radius: 4px;"><i class="fas fa-save" style="margin-right: 6px;"></i> Save Changes</button>
                         </div>
                     </div>
                 </div>
                 
             </div>
         </form>
+
+        <!-- EDIT EMAIL TEMPLATE MODAL -->
+        <div class="modal fade" id="modal-edit-email-template" role="dialog" aria-hidden="true" style="display: none; z-index: 9999;">
+            <div class="modal-dialog modal-lg" style="width: 80% !important; max-width: 1000px;">
+                <div class="modal-content" style="border-radius: 8px; box-shadow: 0 5px 15px rgba(0,0,0,0.1); border: none;">
+                    <div class="modal-body" id="email-template-modal-body" style="padding: 0;">
+                        <div style="padding: 40px; text-align: center; color: #777;">
+                            <i class="fas fa-spinner fa-spin fa-2x" style="margin-bottom: 15px; color: #337ab7;"></i>
+                            <div>Loading template editor...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+        jQuery(document).ready(function() {
+            // Handle Edit Template click
+            jQuery(document).delegate(".edit-email-template-btn", "click", function(e) {
+                e.preventDefault();
+                var templateName = jQuery(this).data("template-name");
+                var brandId = ' . $brand->id . ';
+                
+                jQuery("#email-template-modal-body").html(\'<div style="padding: 40px; text-align: center; color: #777;"><i class="fas fa-spinner fa-spin fa-2x" style="margin-bottom: 15px; color: #337ab7;"></i><div>Loading template editor...</div></div>\');
+                jQuery("#modal-edit-email-template").modal("show");
+                
+                jQuery.post("' . $modulelink . '&action=get_email_template_editor_ajax", {
+                    brand_id: brandId,
+                    template_name: templateName
+                }, function(res) {
+                    if (res.success) {
+                        jQuery("#email-template-modal-body").html(res.html);
+                    } else {
+                        jQuery("#email-template-modal-body").html(\'<div class="alert alert-danger" style="margin: 20px;">Error: \' + res.message + \'</div>\');
+                    }
+                }, "json").fail(function() {
+                    jQuery("#email-template-modal-body").html(\'<div class="alert alert-danger" style="margin: 20px;">Error: Failed to request template details.</div>\');
+                });
+            });
+
+            // Handle toolbar actions
+            jQuery(document).delegate(".toolbar-btn", "click", function(e) {
+                e.preventDefault();
+                var cmd = jQuery(this).data("cmd");
+                var textarea = document.getElementById("template-message-editor");
+                if (!textarea) return;
+                var start = textarea.selectionStart;
+                var end = textarea.selectionEnd;
+                var text = textarea.value;
+                var selectedText = text.substring(start, end);
+                
+                var replacement = "";
+                switch (cmd) {
+                    case "bold":
+                        replacement = "<strong>" + selectedText + "</strong>";
+                        break;
+                    case "italic":
+                        replacement = "<em>" + selectedText + "</em>";
+                        break;
+                    case "underline":
+                        replacement = "<u>" + selectedText + "</u>";
+                        break;
+                    case "bullet":
+                        replacement = "\n<ul>\n  <li>" + (selectedText || "List item") + "</li>\n</ul>\n";
+                        break;
+                    case "number":
+                        replacement = "\n<ol>\n  <li>" + (selectedText || "List item") + "</li>\n</ol>\n";
+                        break;
+                    case "link":
+                        var url = prompt("Enter URL:", "https://");
+                        if (url) {
+                            replacement = \'<a href="\' + url + \'">\' + (selectedText || "Link Text") + \'</a>\';
+                        } else {
+                            return;
+                        }
+                        break;
+                    case "html":
+                        alert("You are already in raw HTML code view mode.");
+                        return;
+                }
+                
+                textarea.value = text.substring(0, start) + replacement + text.substring(end);
+                textarea.focus();
+                textarea.selectionStart = start + replacement.length;
+                textarea.selectionEnd = start + replacement.length;
+            });
+
+            // Handle format block selection
+            jQuery(document).delegate("#editor-format-block", "change", function() {
+                var tag = jQuery(this).val();
+                if (!tag) return;
+                jQuery(this).val(""); // Reset select
+                
+                var textarea = document.getElementById("template-message-editor");
+                if (!textarea) return;
+                var start = textarea.selectionStart;
+                var end = textarea.selectionEnd;
+                var text = textarea.value;
+                var selectedText = text.substring(start, end);
+                
+                var replacement = "<" + tag + ">" + (selectedText || "Text") + "</" + tag + ">";
+                
+                textarea.value = text.substring(0, start) + replacement + text.substring(end);
+                textarea.focus();
+                textarea.selectionStart = start + replacement.length;
+                textarea.selectionEnd = start + replacement.length;
+            });
+
+            // Handle Merge Fields click
+            jQuery(document).delegate(".merge-field-token", "click", function(e) {
+                e.preventDefault();
+                var token = jQuery(this).data("token");
+                var textarea = document.getElementById("template-message-editor");
+                if (!textarea) return;
+                var start = textarea.selectionStart;
+                var end = textarea.selectionEnd;
+                var text = textarea.value;
+                
+                textarea.value = text.substring(0, start) + token + text.substring(end);
+                textarea.focus();
+                textarea.selectionStart = start + token.length;
+                textarea.selectionEnd = start + token.length;
+            });
+
+            // Handle Add Language click
+            jQuery(document).delegate("#btn-add-lang", "click", function(e) {
+                e.preventDefault();
+                var selectedLang = jQuery("#select-new-lang").val();
+                if (!selectedLang) return;
+                
+                if (templateTranslations[selectedLang]) {
+                    alert("Language " + selectedLang + " is already added.");
+                    return;
+                }
+                
+                saveActiveLangState();
+                
+                templateTranslations[selectedLang] = {
+                    subject: "",
+                    message: ""
+                };
+                
+                var label = selectedLang.charAt(0).toUpperCase() + selectedLang.slice(1);
+                var tabLi = \'<li><a href="#" class="lang-tab-link" data-lang="\' + selectedLang + \'" style="font-weight: bold; border-radius: 4px; padding: 8px 16px; border: none; margin-right: 5px;">\' + label + \'</a></li>\';
+                jQuery("#emailTemplateLangTabs").append(tabLi);
+                
+                switchLangTab(selectedLang);
+            });
+
+            // Handle Save template click
+            jQuery(document).delegate("#btn-save-template", "click", function(e) {
+                e.preventDefault();
+                saveActiveLangState();
+                
+                var brandId = ' . $brand->id . ';
+                var templateName = jQuery(this).closest(".modal-content").find(".modal-title").text().replace("Edit Template: ", "").trim();
+                var copyTo = jQuery("#template-copy-to").val();
+                var blindCopyTo = jQuery("#template-blind-copy-to").val();
+                
+                jQuery.post("' . $modulelink . '&action=save_email_template_editor_ajax", {
+                    brand_id: brandId,
+                    template_name: templateName,
+                    copy_to: copyTo,
+                    blind_copy_to: blindCopyTo,
+                    translations: JSON.stringify(templateTranslations)
+                }, function(res) {
+                    if (res.success) {
+                        jQuery("#modal-edit-email-template").modal("hide");
+                        window.location.reload();
+                    } else {
+                        alert("Error: " + res.message);
+                    }
+                }, "json").fail(function() {
+                    alert("Error: Save request failed.");
+                });
+            });
+
+            // Handle Delete Branded template click
+            jQuery(document).delegate("#btn-delete-branded", "click", function(e) {
+                e.preventDefault();
+                if (!confirm("Are you sure you want to restore the default template? This will delete all customized translations for this brand.")) {
+                    return;
+                }
+                
+                var brandId = ' . $brand->id . ';
+                var templateName = jQuery(this).closest(".modal-content").find(".modal-title").text().replace("Edit Template: ", "").trim();
+                
+                jQuery.post("' . $modulelink . '&action=delete_branded_template_ajax", {
+                    brand_id: brandId,
+                    template_name: templateName
+                }, function(res) {
+                    if (res.success) {
+                        jQuery("#modal-edit-email-template").modal("hide");
+                        window.location.reload();
+                    } else {
+                        alert("Error: " + res.message);
+                    }
+                }, "json").fail(function() {
+                    alert("Error: Delete request failed.");
+                });
+            });
+        });
+        </script>
 
         <!-- SERVICES PRICING BOX -->
         <div style="background: #fff; border: 1px solid #e1e1e1; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); overflow: hidden; margin-bottom: 30px; font-family: \'Outfit\', \'Segoe UI\', sans-serif;">
@@ -1764,8 +2640,49 @@ class Controller
                     </table>
                 </div>
             </div>
-        </div>
+        </div>';
 
+        // Add Brand Gateway Modal
+        $output .= '
+        <div id="modal-add-brand-gateway" class="modal fade" role="dialog" style="display: none;">
+            <div class="modal-dialog">
+                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15); font-family: \'Outfit\', sans-serif;">
+                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
+                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
+                        <h4 class="modal-title" style="font-weight: bold; color: #333;"><i class="fas fa-credit-card" style="margin-right: 8px;"></i> Add a Payment Gateway</h4>
+                    </div>
+                    <div class="modal-body" style="padding: 25px;">
+                        <div class="form-group" style="margin-bottom: 20px;">
+                            <label style="font-weight: bold; color: #555; display: block; margin-bottom: 8px; font-size: 0.95em;">Gateway</label>
+                            <select id="add_brand_gateway_select" class="form-control" style="width: 100%; height: 38px; font-size: 0.95em;">
+                                <option value="">Please select ...</option>
+                                <optgroup label="Branded Gateways">
+                                    <option value="paypal" data-whmcs="false">PayPal</option>
+                                    <option value="paypalrest" data-whmcs="false">PayPal REST</option>
+                                    <option value="stripe" data-whmcs="false">Stripe</option>
+                                </optgroup>
+                                <optgroup label="WHMCS Gateways">';
+                                foreach ($whmcsGateways as $gw) {
+                                    if (in_array($gw->gateway, ['paypal', 'stripe'])) {
+                                        continue;
+                                    }
+                                    $output .= '<option value="' . htmlspecialchars($gw->gateway) . '" data-whmcs="true">' . htmlspecialchars($gw->value) . ' (WHMCS)</option>';
+                                }
+        $output .= '
+                                </optgroup>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
+                        <button type="button" id="btn_confirm_add_gateway" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; padding: 6px 16px; font-weight: 600; border-radius: 4px;">Confirm</button>
+                        <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        ';
+
+        $output .= '
         <!-- Pricing Modals for edit page -->
         <div id="modal-assign-product" class="modal fade" role="dialog" style="display: none;">
             <div class="modal-dialog">
@@ -4318,6 +5235,23 @@ class Controller
             'auto_client_assignment' => isset($_POST['auto_client_assignment']) ? 1 : 0,
             'tos_url' => $_POST['tos_url'],
             'signature' => $_POST['signature'],
+            'payment_gateways' => htmlspecialchars_decode($_POST['payment_gateways']),
+            'smtp_settings' => json_encode([
+                'override' => isset($_POST['smtp_override']) ? 1 : 0,
+                'debug' => isset($_POST['smtp_debug']) ? 1 : 0,
+                'port' => htmlspecialchars_decode($_POST['smtp_port']),
+                'mail_type' => htmlspecialchars_decode($_POST['smtp_mail_type']),
+                'hostname' => htmlspecialchars_decode($_POST['smtp_hostname']),
+                'ssl_type' => htmlspecialchars_decode($_POST['smtp_ssl_type']),
+                'username' => htmlspecialchars_decode($_POST['smtp_username']),
+                'password' => htmlspecialchars_decode($_POST['smtp_password']),
+                'disable_email' => isset($_POST['smtp_disable_email']) ? 1 : 0,
+            ]),
+            'email_template_settings' => json_encode([
+                'css' => htmlspecialchars_decode($_POST['css_email_styling']),
+                'header' => htmlspecialchars_decode($_POST['email_header_content']),
+                'footer' => htmlspecialchars_decode($_POST['email_footer_content']),
+            ]),
             'updated_at' => date('Y-m-d H:i:s'),
         ];
 
@@ -4391,6 +5325,47 @@ class Controller
         try {
             if ($id > 0) {
                 Capsule::table('mod_multibrand_brands')->where('id', $id)->update($data);
+                
+                // Process email template status updates
+                $postedStatuses = isset($_POST['email_template_status']) && is_array($_POST['email_template_status']) ? $_POST['email_template_status'] : [];
+                
+                // Get all client-facing template names
+                $clientTemplates = Capsule::table('tblemailtemplates')
+                    ->where('language', '')
+                    ->whereIn('type', ['general', 'product', 'domain', 'support', 'invoice', 'user', 'invite', 'affiliate', 'notification'])
+                    ->pluck('name')
+                    ->toArray();
+                    
+                foreach ($clientTemplates as $templateName) {
+                    $status = isset($postedStatuses[$templateName]) ? 1 : 0;
+                    
+                    $exists = Capsule::table('mod_multibrand_email_templates')
+                        ->where('brand_id', $id)
+                        ->where('template_name', $templateName)
+                        ->exists();
+                        
+                    if ($exists) {
+                        Capsule::table('mod_multibrand_email_templates')
+                            ->where('brand_id', $id)
+                            ->where('template_name', $templateName)
+                            ->update([
+                                'status' => $status,
+                                'updated_at' => date('Y-m-d H:i:s'),
+                            ]);
+                    } else if ($status == 1) {
+                        Capsule::table('mod_multibrand_email_templates')->insert([
+                            'brand_id' => $id,
+                            'template_name' => $templateName,
+                            'status' => 1,
+                            'copy_to' => '',
+                            'blind_copy_to' => '',
+                            'translations' => json_encode([]),
+                            'created_at' => date('Y-m-d H:i:s'),
+                            'updated_at' => date('Y-m-d H:i:s'),
+                        ]);
+                    }
+                }
+                
                 $message = "Brand updated successfully.";
                 echo '<div class="alert alert-success">' . $message . '</div>';
                 $_REQUEST['id'] = $id;
@@ -4410,6 +5385,79 @@ class Controller
             }
             return $this->index($vars);
         }
+    }
+
+    /**
+     * Test SMTP connection credentials via AJAX
+     */
+    public function test_smtp_connection($vars)
+    {
+        header('Content-Type: application/json');
+        
+        $hostname = $_POST['hostname'] ?? '';
+        $port = (int) ($_POST['port'] ?? 25);
+        $username = $_POST['username'] ?? '';
+        $password = $_POST['password'] ?? '';
+        $sslType = $_POST['ssl_type'] ?? '';
+        $mailType = $_POST['mail_type'] ?? 'SMTP';
+
+        if (empty($hostname) || empty($username) || empty($password)) {
+            echo json_encode(['success' => false, 'message' => 'Hostname, Username, and Password are required.']);
+            exit;
+        }
+
+        // Get currently logged in admin email
+        $adminId = isset($_SESSION['adminid']) ? (int)$_SESSION['adminid'] : 0;
+        $adminEmail = '';
+        if ($adminId > 0) {
+            $admin = Capsule::table('tbladmins')->where('id', $adminId)->first();
+            $adminEmail = $admin ? $admin->email : '';
+        }
+
+        if (empty($adminEmail)) {
+            echo json_encode(['success' => false, 'message' => 'Unable to determine currently logged in admin email.']);
+            exit;
+        }
+
+        try {
+            // Instantiate PHPMailer
+            $mail = new \PHPMailer\PHPMailer\PHPMailer(true);
+
+            if (strtolower($mailType) === 'smtp') {
+                $mail->isSMTP();
+                $mail->Host = $hostname;
+                $mail->SMTPAuth = true;
+                $mail->Username = $username;
+                $mail->Password = $password;
+                $mail->Port = $port;
+
+                if (strtolower($sslType) === 'ssl') {
+                    $mail->SMTPSecure = 'ssl';
+                } elseif (strtolower($sslType) === 'tls') {
+                    $mail->SMTPSecure = 'tls';
+                } else {
+                    $mail->SMTPSecure = '';
+                    $mail->SMTPAutoTLS = false;
+                }
+                $mail->Timeout = 10;
+            } else {
+                $mail->isMail();
+            }
+
+            $mail->setFrom($username, $vars['companyname'] ?? 'Multi Brand Outgoing Test');
+            $mail->addAddress($adminEmail);
+
+            $mail->isHTML(true);
+            $mail->Subject = 'Multi Brand - SMTP Connection Test';
+            $mail->Body = '<h3>Multi Brand SMTP Connection Test</h3><p>This email confirms that your outgoing SMTP credentials for the brand are correct and working perfectly.</p>';
+
+            $mail->send();
+
+            echo json_encode(['success' => true, 'message' => 'Connection successful! A test email has been sent to ' . htmlspecialchars($adminEmail)]);
+        } catch (\Exception $e) {
+            echo json_encode(['success' => false, 'message' => 'Connection failed: ' . $e->getMessage()]);
+        }
+        exit;
     }
 
     /**
@@ -4438,7 +5486,7 @@ class Controller
         $title = $brand ? 'Edit Brand: ' . htmlspecialchars($brand->brand_name) : 'Add New Brand';
 
         $output = '<h2>' . $title . '</h2>';
-        $output .= '<form method="post" action="' . $modulelink . '&action=save" enctype="multipart/form-data">';
+        $output .= '<form method="post" action="' . $modulelink . '&action=save" enctype="multipart/form-data" novalidate>';
         if ($brand) {
             $output .= '<input type="hidden" name="id" value="' . $brand->id . '">';
         }
@@ -8076,5 +9124,338 @@ class Controller
             return $this->relations($vars);
         }
         return $this->edit($vars);
+    }
+
+    /**
+     * AJAX endpoint to render the dynamic multi-lingual template editor modal
+     */
+    public function get_email_template_editor_ajax($vars)
+    {
+        $brandId = (int)$_POST['brand_id'];
+        $templateName = $_POST['template_name'];
+        
+        $brand = Capsule::table('mod_multibrand_brands')->where('id', $brandId)->first();
+        if (!$brand) {
+            echo json_encode(['success' => false, 'message' => 'Brand not found.']);
+            exit;
+        }
+        
+        $defaultTemplate = Capsule::table('tblemailtemplates')
+            ->where('language', '')
+            ->where('name', $templateName)
+            ->first();
+            
+        if (!$defaultTemplate) {
+            echo json_encode(['success' => false, 'message' => 'Template not found.']);
+            exit;
+        }
+        
+        $branded = Capsule::table('mod_multibrand_email_templates')
+            ->where('brand_id', $brandId)
+            ->where('template_name', $templateName)
+            ->first();
+            
+        $copyTo = $branded ? $branded->copy_to : '';
+        $blindCopyTo = $branded ? $branded->blind_copy_to : '';
+        
+        $translationsData = [];
+        if ($branded && !empty($branded->translations)) {
+            $translationsData = json_decode(htmlspecialchars_decode($branded->translations), true);
+        }
+        
+        // Ensure default is prefilled
+        if (empty($translationsData['default'])) {
+            $translationsData['default'] = [
+                'subject' => $defaultTemplate->subject,
+                'message' => $defaultTemplate->message
+            ];
+        }
+        
+        // Get all languages list
+        $standardLangs = ['arabic', 'azerbaijani', 'catalan', 'chinese', 'croatian', 'czech', 'danish', 'dutch', 'english', 'estonian', 'farsi', 'french', 'german', 'hebrew', 'hungarian', 'italian', 'norwegian', 'persian', 'portuguese-br', 'portuguese-pt', 'romanian', 'russian', 'spanish', 'swedish', 'turkish', 'ukrainian'];
+        $dbLanguages = Capsule::table('tblemailtemplates')
+            ->where('language', '!=', '')
+            ->distinct()
+            ->pluck('language')
+            ->toArray();
+        $allLanguages = array_unique(array_merge($standardLangs, $dbLanguages));
+        sort($allLanguages);
+        
+        // Merge fields
+        $mergeFields = [
+            'Client ID' => '{$client_id}',
+            'First Name' => '{$client_first_name}',
+            'Last Name' => '{$client_last_name}',
+            'Company Name' => '{$client_company_name}',
+            'Email Address' => '{$client_email}',
+            'Address 1' => '{$client_address1}',
+            'Address 2' => '{$client_address2}',
+            'City' => '{$client_city}',
+            'State/Region' => '{$client_state}',
+            'Postcode' => '{$client_postcode}',
+            'Country' => '{$client_country}',
+            'Phone Number' => '{$client_phonenumber}',
+            'Credit Balance' => '{$client_credit}'
+        ];
+        
+        $type = strtolower($defaultTemplate->type);
+        if ($type == 'product') {
+            $mergeFields += [
+                'Service ID' => '{$service_id}',
+                'Product Name' => '{$service_product_name}',
+                'Domain' => '{$service_domain}',
+                'Username' => '{$service_username}',
+                'Password' => '{$service_password}',
+                'Billing Cycle' => '{$service_billing_cycle}'
+            ];
+        } else if ($type == 'domain') {
+            $mergeFields += [
+                'Domain Name' => '{$domain_name}',
+                'Expiry Date' => '{$domain_expiry_date}',
+                'Registrar' => '{$domain_registrar}',
+                'Status' => '{$domain_status}'
+            ];
+        } else if ($type == 'support') {
+            $mergeFields += [
+                'Ticket ID' => '{$ticket_id}',
+                'Subject' => '{$ticket_subject}',
+                'Message' => '{$ticket_message}',
+                'Status' => '{$ticket_status}'
+            ];
+        } else if ($type == 'invoice') {
+            $mergeFields += [
+                'Invoice ID' => '{$invoice_id}',
+                'Invoice Number' => '{$invoice_num}',
+                'Date Created' => '{$invoice_date_created}',
+                'Date Due' => '{$invoice_date_due}',
+                'Total' => '{$invoice_total}'
+            ];
+        }
+        
+        // Render tabs
+        $tabsHtml = '';
+        foreach ($translationsData as $lang => $tData) {
+            $isActive = ($lang === 'default');
+            $label = ucfirst($lang);
+            $tabsHtml .= '<li class="' . ($isActive ? 'active' : '') . '"><a href="#" class="lang-tab-link" data-lang="' . htmlspecialchars($lang) . '" style="font-weight: bold; border-radius: 4px; padding: 8px 16px; border: none; margin-right: 5px;">' . htmlspecialchars($label) . '</a></li>';
+        }
+        
+        // Language options
+        $langOptions = '';
+        foreach ($allLanguages as $lang) {
+            if ($lang === 'english' || isset($translationsData[$lang])) continue;
+            $langOptions .= '<option value="' . htmlspecialchars($lang) . '">' . htmlspecialchars(ucfirst($lang)) . '</option>';
+        }
+        
+        // Merge fields helper list
+        $mergeFieldsHtml = '';
+        foreach ($mergeFields as $label => $token) {
+            $mergeFieldsHtml .= '<div style="display: flex; justify-content: space-between; padding: 6px 10px; border-bottom: 1px solid #f0f0f0; font-size: 0.85em;">
+                <span style="color: #666; font-weight: 500;">' . htmlspecialchars($label) . '</span>
+                <a href="#" class="merge-field-token" data-token="' . htmlspecialchars($token) . '" style="font-family: Courier, monospace; font-weight: bold; color: #337ab7; text-decoration: none;">' . htmlspecialchars($token) . '</a>
+            </div>';
+        }
+        
+        $html = '
+        <div class="modal-header" style="border-bottom: 1px solid #eee; padding: 15px 20px; display: flex; justify-content: space-between; align-items: center;">
+            <h4 class="modal-title" style="margin: 0; font-weight: bold; color: #333;"><i class="fas fa-envelope-open-text" style="margin-right: 8px; color: #337ab7;"></i> Edit Template: ' . htmlspecialchars($templateName) . '</h4>
+            <button type="button" class="close" data-dismiss="modal" aria-label="Close" style="font-size: 1.5em; background: none; border: none; opacity: 0.5; outline: none;">&times;</button>
+        </div>
+        <div class="modal-body" style="padding: 20px; font-family: inherit;">
+            <div style="display: flex; gap: 20px; margin-bottom: 20px;">
+                <div style="flex: 1;">
+                    <label style="font-weight: bold; color: #555; margin-bottom: 5px; font-size: 0.9em; display: block;">Copy To</label>
+                    <div style="display: flex; align-items: center; gap: 15px;">
+                        <input type="text" id="template-copy-to" class="form-control" value="' . htmlspecialchars($copyTo) . '" placeholder="e.g. billing@brand.com" style="flex: 1;">
+                        <span style="font-size: 0.82em; color: #777; width: 220px; line-height: 1.3;">Enter email addresses separated by a comma.</span>
+                    </div>
+                </div>
+                <div style="flex: 1;">
+                    <label style="font-weight: bold; color: #555; margin-bottom: 5px; font-size: 0.9em; display: block;">Blind Copy To</label>
+                    <div style="display: flex; align-items: center; gap: 15px;">
+                        <input type="text" id="template-blind-copy-to" class="form-control" value="' . htmlspecialchars($blindCopyTo) . '" placeholder="e.g. archive@brand.com" style="flex: 1;">
+                        <span style="font-size: 0.82em; color: #777; width: 220px; line-height: 1.3;">Enter email addresses separated by a comma.</span>
+                    </div>
+                </div>
+            </div>
+            
+            <ul class="nav nav-tabs" id="emailTemplateLangTabs" style="margin-bottom: 15px; border-bottom: 2px solid #eee;">
+                ' . $tabsHtml . '
+            </ul>
+            
+            <div style="margin-bottom: 15px;">
+                <label style="font-weight: bold; color: #555; margin-bottom: 5px; font-size: 0.9em; display: block;">Subject</label>
+                <input type="text" id="template-subject" class="form-control" value="' . htmlspecialchars($translationsData['default']['subject']) . '" style="font-weight: 500;">
+            </div>
+            
+            <div style="display: flex; gap: 20px; align-items: stretch; margin-bottom: 20px;">
+                <div style="flex: 3; display: flex; flex-direction: column;">
+                    <label style="font-weight: bold; color: #555; margin-bottom: 5px; font-size: 0.9em;">Message</label>
+                    <div class="editor-toolbar" style="background: #f5f5f5; border: 1px solid #ccc; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; padding: 6px 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                        <select id="editor-format-block" class="form-control input-sm" style="width: 120px; display: inline-block; height: 28px; padding: 2px 6px;">
+                            <option value="">Normal Text</option>
+                            <option value="h1">Heading 1</option>
+                            <option value="h2">Heading 2</option>
+                            <option value="h3">Heading 3</option>
+                            <option value="p">Paragraph</option>
+                        </select>
+                        <button type="button" class="btn btn-default btn-xs toolbar-btn" data-cmd="bold" title="Bold" style="font-weight: bold; width: 28px; height: 28px; line-height: 24px; padding: 0;">B</button>
+                        <button type="button" class="btn btn-default btn-xs toolbar-btn" data-cmd="italic" title="Italic" style="font-style: italic; width: 28px; height: 28px; line-height: 24px; padding: 0;">I</button>
+                        <button type="button" class="btn btn-default btn-xs toolbar-btn" data-cmd="underline" title="Underline" style="text-decoration: underline; width: 28px; height: 28px; line-height: 24px; padding: 0;">U</button>
+                        <button type="button" class="btn btn-default btn-xs toolbar-btn" data-cmd="bullet" title="Bullet List" style="width: 28px; height: 28px; line-height: 24px; padding: 0;"><i class="fas fa-list-ul"></i></button>
+                        <button type="button" class="btn btn-default btn-xs toolbar-btn" data-cmd="number" title="Numbered List" style="width: 28px; height: 28px; line-height: 24px; padding: 0;"><i class="fas fa-list-ol"></i></button>
+                        <button type="button" class="btn btn-default btn-xs toolbar-btn" data-cmd="link" title="Insert Link" style="width: 28px; height: 28px; line-height: 24px; padding: 0;"><i class="fas fa-link"></i></button>
+                        <button type="button" class="btn btn-default btn-xs toolbar-btn" data-cmd="html" title="HTML Code View" style="width: 28px; height: 28px; line-height: 24px; padding: 0;"><i class="fas fa-code"></i></button>
+                    </div>
+                    <textarea id="template-message-editor" class="form-control" style="border-top-left-radius: 0; border-top-right-radius: 0; font-family: Courier, monospace; font-size: 13px; height: 350px; line-height: 1.5; padding: 12px; resize: vertical;">' . htmlspecialchars($translationsData['default']['message']) . '</textarea>
+                </div>
+                
+                <div style="flex: 1; border: 1px solid #ddd; border-radius: 4px; display: flex; flex-direction: column; background: #fafafa; max-height: 405px;">
+                    <div style="background: #eee; padding: 8px 12px; font-weight: bold; border-bottom: 1px solid #ddd; font-size: 0.9em; color: #444;"><i class="fas fa-database" style="margin-right: 6px;"></i> Merge Fields</div>
+                    <div style="overflow-y: auto; flex: 1;" id="merge-fields-scroller">
+                        ' . $mergeFieldsHtml . '
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #eee; padding: 15px 20px; display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <select id="select-new-lang" class="form-control input-sm" style="width: 130px; display: inline-block;">
+                    <option value="">Choose...</option>
+                    ' . $langOptions . '
+                </select>
+                <button type="button" id="btn-add-lang" class="btn btn-default btn-sm" style="background: #f0f0f0; border-color: #ccc; font-weight: 600;"><i class="fas fa-plus" style="margin-right: 4px; color: #d9534f;"></i> Add Language</button>
+            </div>
+            
+            <div style="display: flex; gap: 8px;">
+                ' . ($branded ? '<button type="button" id="btn-delete-branded" class="btn btn-danger btn-sm" style="background-color: #d9534f; border-color: #d43f3a; font-weight: bold;"><i class="fas fa-trash-alt" style="margin-right: 6px;"></i> Delete Branded Template</button>' : '') . '
+                <button type="button" id="btn-save-template" class="btn btn-success btn-sm" style="background-color: #5cb85c; border-color: #4cae4c; font-weight: bold;"><i class="fas fa-save" style="margin-right: 6px;"></i> Save</button>
+                <button type="button" class="btn btn-default btn-sm" data-dismiss="modal" style="font-weight: bold;">Close</button>
+            </div>
+        </div>
+        
+        <script>
+        templateTranslations = ' . json_encode($translationsData) . ';
+        activeLangTab = "default";
+        
+        function saveActiveLangState() {
+            if (activeLangTab) {
+                templateTranslations[activeLangTab] = {
+                    subject: jQuery("#template-subject").val(),
+                    message: jQuery("#template-message-editor").val()
+                };
+            }
+        }
+        
+        function switchLangTab(newLang) {
+            saveActiveLangState();
+            activeLangTab = newLang;
+            
+            jQuery("#template-subject").val(templateTranslations[newLang].subject || "");
+            jQuery("#template-message-editor").val(templateTranslations[newLang].message || "");
+            
+            jQuery("#emailTemplateLangTabs li").removeClass("active");
+            jQuery("#emailTemplateLangTabs li a").each(function() {
+                if (jQuery(this).data("lang") === newLang) {
+                    jQuery(this).parent().addClass("active");
+                }
+            });
+            
+            var langSelect = jQuery("#select-new-lang");
+            langSelect.find("option").each(function() {
+                var val = jQuery(this).val();
+                if (val) {
+                    if (templateTranslations[val]) {
+                        jQuery(this).hide();
+                    } else {
+                        jQuery(this).show();
+                    }
+                }
+            });
+            langSelect.val("");
+        }
+        
+        jQuery(document).off("click", ".lang-tab-link").on("click", ".lang-tab-link", function(e) {
+            e.preventDefault();
+            var targetLang = jQuery(this).data("lang");
+            switchLangTab(targetLang);
+        });
+        </script>
+        ';
+        
+        echo json_encode(['success' => true, 'html' => $html]);
+        exit;
+    }
+
+    /**
+     * AJAX endpoint to save custom branded template overrides
+     */
+    public function save_email_template_editor_ajax($vars)
+    {
+        $brandId = (int)$_POST['brand_id'];
+        $templateName = $_POST['template_name'];
+        $copyTo = $_POST['copy_to'];
+        $blindCopyTo = $_POST['blind_copy_to'];
+        $translations = $_POST['translations'];
+        
+        $brand = Capsule::table('mod_multibrand_brands')->where('id', $brandId)->first();
+        if (!$brand) {
+            echo json_encode(['success' => false, 'message' => 'Brand not found.']);
+            exit;
+        }
+        
+        $translationsDecoded = json_decode($translations, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            echo json_encode(['success' => false, 'message' => 'Invalid translation data format.']);
+            exit;
+        }
+        
+        $exists = Capsule::table('mod_multibrand_email_templates')
+            ->where('brand_id', $brandId)
+            ->where('template_name', $templateName)
+            ->exists();
+            
+        if ($exists) {
+            Capsule::table('mod_multibrand_email_templates')
+                ->where('brand_id', $brandId)
+                ->where('template_name', $templateName)
+                ->update([
+                    'copy_to' => $copyTo,
+                    'blind_copy_to' => $blindCopyTo,
+                    'translations' => json_encode($translationsDecoded),
+                    'updated_at' => date('Y-m-d H:i:s'),
+                ]);
+        } else {
+            Capsule::table('mod_multibrand_email_templates')->insert([
+                'brand_id' => $brandId,
+                'template_name' => $templateName,
+                'status' => 1,
+                'copy_to' => $copyTo,
+                'blind_copy_to' => $blindCopyTo,
+                'translations' => json_encode($translationsDecoded),
+                'created_at' => date('Y-m-d H:i:s'),
+                'updated_at' => date('Y-m-d H:i:s'),
+            ]);
+        }
+        
+        echo json_encode(['success' => true]);
+        exit;
+    }
+
+    /**
+     * AJAX endpoint to delete customized brand templates
+     */
+    public function delete_branded_template_ajax($vars)
+    {
+        $brandId = (int)$_POST['brand_id'];
+        $templateName = $_POST['template_name'];
+        
+        Capsule::table('mod_multibrand_email_templates')
+            ->where('brand_id', $brandId)
+            ->where('template_name', $templateName)
+            ->delete();
+            
+        echo json_encode(['success' => true]);
+        exit;
     }
 }
