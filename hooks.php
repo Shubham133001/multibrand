@@ -9,6 +9,8 @@ if (!defined("WHMCS")) {
     die("This file cannot be accessed directly");
 }
 
+// file_put_contents(__DIR__ . '/hooks_loaded.log', "Loaded at " . date('Y-m-d H:i:s') . " | URI: " . ($_SERVER['REQUEST_URI'] ?? '') . "\n", FILE_APPEND);
+
 use WHMCS\Database\Capsule;
 
 // Dynamically create service brands table if missing to ensure seamless upgrades
@@ -179,10 +181,49 @@ if (isset($_POST['multibrand_id'])) {
  * Safely parses request and DB brand domains to match hostnames correctly.
  * Returns the matched brand, falling back to the active default brand.
  */
+if (!function_exists('get_multibrand_active_brand')) {
 function get_multibrand_active_brand()
 {
     $requestHost = strtolower($_SERVER['SERVER_NAME']);
     $requestHostClean = ltrim($requestHost, 'www.');
+// print_r($_SESSION);die();
+    // If client is logged in and has manually switched brand context, use it
+    if (isset($_SESSION['uid']) && $_SESSION['uid'] > 0 && isset($_SESSION['multibrand_brand_id'])) {
+        $brandId = (int)$_SESSION['multibrand_brand_id'];
+        if ($brandId > 0) {
+            try {
+                $isAssigned = Capsule::table('mod_multibrand_client_brands')
+                    ->where('client_id', $_SESSION['uid'])
+                    ->where('brand_id', $brandId)
+                    ->exists();
+                if ($isAssigned) {
+                    $brand = Capsule::table('mod_multibrand_brands')
+                        ->where('id', $brandId)
+                        ->where('status', 1)
+                        ->first();
+                    if ($brand) {
+                        // Validate that the session brand's domain matches the current request domain
+                        $brandUrl = $brand->domain;
+                        if ($brandUrl) {
+                            if (strpos($brandUrl, '://') === false) {
+                                $brandUrl = 'http://' . $brandUrl;
+                            }
+                            $brandHost = strtolower(parse_url($brandUrl, PHP_URL_HOST));
+                            $brandHostClean = ltrim($brandHost, 'www.');
+
+                            if ($brandHostClean !== '' && $brandHostClean !== $requestHostClean && strpos($brandHostClean, $requestHostClean) === false && strpos($requestHostClean, $brandHostClean) === false) {
+                                $brand = null;
+                            }
+                        }
+                        
+                        if ($brand) {
+                            return $brand;
+                        }
+                    }
+                }
+            } catch (\Exception $e) {}
+        }
+    }
 
     try {
         $brands = Capsule::table('mod_multibrand_brands')
@@ -229,12 +270,14 @@ function get_multibrand_active_brand()
         return null;
     }
 }
+}
 
 /**
  * Clean Domain Matcher Helper (No Fallback)
  * Checks if the current request domain exists as a brand in our module.
  * Returns the matched brand, or null if no exact match is found.
  */
+if (!function_exists('get_multibrand_brand_by_domain')) {
 function get_multibrand_brand_by_domain()
 {
     $requestHost = strtolower($_SERVER['SERVER_NAME']);
@@ -280,13 +323,44 @@ function get_multibrand_brand_by_domain()
 
     return null;
 }
+}
 
 /**
  * Client Area Initialization Hook
  * Dynamically changes the active global template theme in memory before the Smarty engine boots.
  * This ensures WHMCS loads the brand's custom theme fully (headers, footers, CSS) and prevents mismatches.
+ * Also intercepts manual client-side brand switch requests.
  */
 add_hook('ClientAreaInit', 1, function ($vars) {
+    // Handle manual brand context switch request
+    if (isset($_GET['brand_switch'])) {
+        $brandId = (int)$_GET['brand_switch'];
+        $loggedInClientId = (int)($_SESSION['uid'] ?? 0);
+        
+        if ($loggedInClientId > 0 && $brandId > 0) {
+            try {
+                $isAssigned = Capsule::table('mod_multibrand_client_brands')
+                    ->where('client_id', $loggedInClientId)
+                    ->where('brand_id', $brandId)
+                    ->exists();
+                    
+                if ($isAssigned) {
+                    $_SESSION['multibrand_brand_id'] = $brandId;
+                    
+                    // Redirect back to clean URL to remove brand_switch query param
+                    $redirectUrl = strtok($_SERVER["REQUEST_URI"], '?');
+                    $params = $_GET;
+                    unset($params['brand_switch']);
+                    if (!empty($params)) {
+                        $redirectUrl .= '?' . http_build_query($params);
+                    }
+                    header("Location: " . $redirectUrl);
+                    exit;
+                }
+            } catch (\Exception $e) {}
+        }
+    }
+
     $brand = get_multibrand_active_brand();
     if ($brand && $brand->system_theme) {
         $theme = strtolower($brand->system_theme);
@@ -296,35 +370,124 @@ add_hook('ClientAreaInit', 1, function ($vars) {
 });
 
 /**
- * Client Area Page Hook
- * Overrides company name, logo, language, and other branding elements.
- * Also handles Maintenance Mode, custom TOS, and HTML Invoice page overrides.
+ * Dynamic Multi-Brand Client Stats Helper
+ * Dynamically computes brand-specific totals for a logged-in client.
  */
-add_hook('ClientAreaPage', 1, function ($vars) {
-    $brand = null;
-    $filename = $vars['filename'] ?? '';
+if (!function_exists('get_multibrand_client_stats')) {
+function get_multibrand_client_stats($clientId, $brandId)
+{
+    static $stats = [];
+    $cacheKey = (int)$clientId . '_' . (int)$brandId;
+    if (isset($stats[$cacheKey])) {
+        return $stats[$cacheKey];
+    }
 
-    // If viewing a specific HTML invoice, resolve brand dynamically by the invoice
-    if ($filename == 'viewinvoice' && isset($_GET['id'])) {
-        $invoiceId = (int)$_GET['id'];
+    $activeServices = 0;
+    $totalServices = 0;
+    $unpaidInvoices = 0;
+    $totalInvoices = 0;
+    $activeTickets = 0;
+    $totalTickets = 0;
+
+    if ($clientId > 0 && $brandId > 0) {
         try {
-            $invBrand = Capsule::table('mod_multibrand_invoice_brands')->where('invoice_id', $invoiceId)->first();
-            if ($invBrand) {
-                $brand = Capsule::table('mod_multibrand_brands')->where('id', $invBrand->brand_id)->where('status', 1)->first();
-            }
+            $activeServices = (int)Capsule::table('tblhosting')
+                ->join('mod_multibrand_service_brands', 'tblhosting.id', '=', 'mod_multibrand_service_brands.service_id')
+                ->where('tblhosting.userid', $clientId)
+                ->where('mod_multibrand_service_brands.brand_id', $brandId)
+                ->where('tblhosting.domainstatus', 'Active')
+                ->count();
+
+            $totalServices = (int)Capsule::table('tblhosting')
+                ->join('mod_multibrand_service_brands', 'tblhosting.id', '=', 'mod_multibrand_service_brands.service_id')
+                ->where('tblhosting.userid', $clientId)
+                ->where('mod_multibrand_service_brands.brand_id', $brandId)
+                ->count();
+
+            $unpaidInvoices = (int)Capsule::table('tblinvoices')
+                ->join('mod_multibrand_invoice_brands', 'tblinvoices.id', '=', 'mod_multibrand_invoice_brands.invoice_id')
+                ->where('tblinvoices.userid', $clientId)
+                ->where('mod_multibrand_invoice_brands.brand_id', $brandId)
+                ->where('tblinvoices.status', 'Unpaid')
+                ->count();
+
+            $totalInvoices = (int)Capsule::table('tblinvoices')
+                ->join('mod_multibrand_invoice_brands', 'tblinvoices.id', '=', 'mod_multibrand_invoice_brands.invoice_id')
+                ->where('tblinvoices.userid', $clientId)
+                ->where('mod_multibrand_invoice_brands.brand_id', $brandId)
+                ->count();
+
+            $activeTickets = (int)Capsule::table('tbltickets')
+                ->join('mod_multibrand_ticket_brands', 'tbltickets.id', '=', 'mod_multibrand_ticket_brands.ticket_id')
+                ->where('tbltickets.userid', $clientId)
+                ->where('mod_multibrand_ticket_brands.brand_id', $brandId)
+                ->where('tbltickets.status', '!=', 'Closed')
+                ->count();
+
+            $totalTickets = (int)Capsule::table('tbltickets')
+                ->join('mod_multibrand_ticket_brands', 'tbltickets.id', '=', 'mod_multibrand_ticket_brands.ticket_id')
+                ->where('tbltickets.userid', $clientId)
+                ->where('mod_multibrand_ticket_brands.brand_id', $brandId)
+                ->count();
         } catch (\Exception $e) {}
     }
 
-    // Fallback to active domain domain-match brand
-    if (!$brand) {
-        $brand = get_multibrand_active_brand();
-    }
+    $stats[$cacheKey] = [
+        'active_services' => $activeServices,
+        'total_services'  => $totalServices,
+        'unpaid_invoices' => $unpaidInvoices,
+        'total_invoices'  => $totalInvoices,
+        'active_tickets'  => $activeTickets,
+        'total_tickets'   => $totalTickets,
+    ];
 
-    if ($brand) {
+    return $stats[$cacheKey];
+}
+}
+
+/**
+ * Client Area Page Hook
+ * Overrides company name, logo, language, and other branding elements.
+ * Also handles Maintenance Mode, custom TOS, and HTML Invoice page overrides.
+ * Performs dynamic brand-wise data filtering (services, invoices, support tickets) on templates.
+ */
+add_hook('ClientAreaPage', 1, function ($vars) {
+    try {
+        $brand = null;
+        $filename = $vars['filename'] ?? '';
+        // file_put_contents(__DIR__ . '/requested_filenames.log', "----------------------------------------\n" . $filename . ' | ' . ($_SERVER['REQUEST_URI'] ?? '') . "\n", FILE_APPEND);
+
+        // If viewing a specific HTML invoice, resolve brand dynamically by the invoice
+        if ($filename == 'viewinvoice' && isset($_GET['id'])) {
+            $invoiceId = (int)$_GET['id'];
+            try {
+                $invBrand = Capsule::table('mod_multibrand_invoice_brands')->where('invoice_id', $invoiceId)->first();
+                if ($invBrand) {
+                    $brand = Capsule::table('mod_multibrand_brands')->where('id', $invBrand->brand_id)->where('status', 1)->first();
+                }
+            } catch (\Exception $e) {}
+        }
+
+        if (!$brand) {
+            $brand = get_multibrand_active_brand();
+        }
+
+        // file_put_contents(__DIR__ . '/requested_filenames.log', "Resolved Brand: " . ($brand ? $brand->brand_name . " (ID: " . $brand->id . ")" : "NONE") . "\n", FILE_APPEND);
+        
+        $productsType = isset($vars['products']) ? gettype($vars['products']) : 'NOT SET';
+        $productGroupsType = isset($vars['productgroups']) ? gettype($vars['productgroups']) : 'NOT SET';
+        // file_put_contents(__DIR__ . '/requested_filenames.log', "Vars products type: $productsType | productgroups type: $productGroupsType\n", FILE_APPEND);
+
+        if ($brand) {
+            // file_put_contents(__DIR__ . '/requested_filenames.log', "Brand products_branding setting: " . ($brand->products_branding ? '1' : '0') . " | price_override setting: " . ($brand->price_override ? '1' : '0') . "\n", FILE_APPEND);
         // Maintenance Mode handling
         if ($brand->maintenance_mode) {
             if ($brand->maintenance_mode_redirect_url) {
-                header("Location: " . $brand->maintenance_mode_redirect_url);
+                $url = trim($brand->maintenance_mode_redirect_url);
+                if (!preg_match('#^https?://#i', $url)) {
+                    $url = 'https://' . $url;
+                }
+                header('Location: ' . $url);
                 exit;
             } else {
                 $message = $brand->maintenance_mode_message ?: "We are currently performing maintenance and will be back shortly.";
@@ -351,12 +514,543 @@ add_hook('ClientAreaPage', 1, function ($vars) {
             $overrides['tosurl'] = $brand->tos_url;
         }
 
+        if ($brand->order_template) {
+            $overrides['carttemplate'] = $brand->order_template;
+        }
+
         // Custom HTML Invoice layout variables override
         if ($filename == 'viewinvoice' && $brand->pay_to_text) {
             $overrides['payto'] = nl2br($brand->pay_to_text);
         }
 
+        // --- Brand-wise Shopping Cart Catalog Filtering & Pricing Overrides ---
+        $prodCount = isset($vars['products']) && is_array($vars['products']) ? count($vars['products']) : 'NOT ARRAY';
+        $groupCount = isset($vars['productgroups']) && is_array($vars['productgroups']) ? count($vars['productgroups']) : 'NOT ARRAY';
+        // file_put_contents(__DIR__ . '/requested_filenames.log', "Cart override check: filename = $filename | products_branding = " . ($brand->products_branding ? '1' : '0') . " | products count: $prodCount | productgroups count: $groupCount\n", FILE_APPEND);
+        if ((in_array($filename, ['cart', 'index']) || isset($vars['productgroups']) || isset($vars['products'])) && $brand->products_branding) {
+            $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+            $brandProductIds = isset($pricingOverrides['products']) ? array_keys($pricingOverrides['products']) : [];
+            // file_put_contents(__DIR__ . '/requested_filenames.log', "Entered cart override block. Brand Product IDs: " . implode(',', $brandProductIds) . "\n", FILE_APPEND);
+
+            // Filter products list for sale in current category and apply brand pricing overrides
+            if (isset($vars['products']) && is_array($vars['products'])) {
+                $filteredProducts = [];
+                foreach ($vars['products'] as $product) {
+                    $productId = 0;
+                    if (is_array($product)) {
+                        $productId = isset($product['id']) ? (int)$product['id'] : (isset($product['pid']) ? (int)$product['pid'] : 0);
+                    } elseif (is_object($product)) {
+                        $productId = isset($product->id) ? (int)$product->id : (isset($product->pid) ? (int)$product->pid : 0);
+                    }
+                    
+                    // Apply branding catalog visibility filter (if brand has attached products)
+                    if (!empty($brandProductIds) && !in_array($productId, $brandProductIds)) {
+                        continue;
+                    }
+
+                    // Apply brand pricing overrides if active
+                    if ($brand->price_override && $productId > 0) {
+                        $currencyId = (int)($vars['activeCurrency']['id'] ?? $_SESSION['currency'] ?? 1);
+                        $rates = $pricingOverrides['products'][$productId]['pricing'][$currencyId] ?? [];
+                        // file_put_contents(__DIR__ . '/cart_debug_output.txt', "Product ID: $productId | Currency ID: $currencyId | Rates: " . print_r($rates, true) . "\n", FILE_APPEND);
+                        
+                        if (!empty($rates)) {
+                            $isObj = is_object($product);
+                            $paytype = $isObj ? ($product->paytype ?? '') : ($product['paytype'] ?? '');
+                            $pricing = $isObj ? (array)($product->pricing ?? []) : ($product['pricing'] ?? []);
+                            
+                            if ($paytype == 'onetime') {
+                                $newPrice = isset($rates['monthly']) && $rates['monthly'] !== '' ? (float)$rates['monthly'] : null;
+                                $newSetup = isset($rates['msetupfee']) && $rates['msetupfee'] !== '' ? (float)$rates['msetupfee'] : null;
+                                
+                                if ($newPrice !== null) {
+                                    $pricing['rawpricing']['monthly'] = number_format($newPrice, 2, '.', '');
+                                    $pricing['rawpricing']['simple'] = formatCurrency($newPrice, $currencyId);
+                                }
+                                if ($newSetup !== null) {
+                                    $pricing['rawpricing']['msetupfee'] = number_format($newSetup, 2, '.', '');
+                                }
+                                
+                                $priceVal = $newPrice !== null ? $newPrice : (float)($pricing['rawpricing']['monthly'] ?? 0);
+                                $setupVal = $newSetup !== null ? $newSetup : (float)($pricing['rawpricing']['msetupfee'] ?? 0);
+                                
+                                $onetimeString = formatCurrency($priceVal, $currencyId);
+                                if ($setupVal > 0) {
+                                    $setupLang = $vars['_LANG']['ordersetupfee'] ?? 'Setup Fee';
+                                    $onetimeString .= ' + ' . formatCurrency($setupVal, $currencyId) . ' ' . $setupLang;
+                                }
+                                $pricing['onetime'] = $onetimeString;
+                                $pricing['cycles']['onetime'] = $onetimeString;
+                                
+                                $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+                                if ($currencyObj) {
+                                    if (!is_array($pricing['minprice'] ?? null)) {
+                                        $pricing['minprice'] = [];
+                                    }
+                                    $pricing['minprice']['price'] = new \WHMCS\View\Formatter\Price($priceVal, $currencyObj);
+                                    $pricing['minprice']['setupFee'] = new \WHMCS\View\Formatter\Price($setupVal, $currencyObj);
+                                    $pricing['minprice']['cycle'] = 'onetime';
+                                    $pricing['minprice']['simple'] = formatCurrency($priceVal, $currencyId);
+                                }
+                            } elseif ($paytype == 'recurring') {
+                                $cyclesKeys = [
+                                    'monthly' => ['price' => 'monthly', 'setup' => 'msetupfee', 'lang' => 'orderpaymenttermmonthly'],
+                                    'quarterly' => ['price' => 'quarterly', 'setup' => 'qsetupfee', 'lang' => 'orderpaymenttermquarterly'],
+                                    'semiannually' => ['price' => 'semiannually', 'setup' => 'ssetupfee', 'lang' => 'orderpaymenttermsemiannually'],
+                                    'annually' => ['price' => 'annually', 'setup' => 'asetupfee', 'lang' => 'orderpaymenttermannually'],
+                                    'biennially' => ['price' => 'biennially', 'setup' => 'bsetupfee', 'lang' => 'orderpaymenttermbiennially'],
+                                    'triennially' => ['price' => 'triennially', 'setup' => 'tsetupfee', 'lang' => 'orderpaymenttermtriennially'],
+                                ];
+                                
+                                $enabledPrices = [];
+                                $enabledSetups = [];
+                                
+                                foreach ($cyclesKeys as $cycle => $cData) {
+                                    $origPrice = (float)($pricing['rawpricing'][$cycle] ?? -1.00);
+                                    if ($origPrice >= 0) {
+                                        $newPrice = isset($rates[$cData['price']]) && $rates[$cData['price']] !== '' ? (float)$rates[$cData['price']] : null;
+                                        $newSetup = isset($rates[$cData['setup']]) && $rates[$cData['setup']] !== '' ? (float)$rates[$cData['setup']] : null;
+                                        
+                                        if ($newPrice !== null) {
+                                            $pricing['rawpricing'][$cycle] = number_format($newPrice, 2, '.', '');
+                                        }
+                                        if ($newSetup !== null) {
+                                            $pricing['rawpricing'][$cData['setup']] = number_format($newSetup, 2, '.', '');
+                                        }
+                                        
+                                        $priceVal = $newPrice !== null ? $newPrice : $origPrice;
+                                        $setupVal = $newSetup !== null ? $newSetup : (float)($pricing['rawpricing'][$cData['setup']] ?? 0);
+                                        
+                                        $cycleString = formatCurrency($priceVal, $currencyId) . ' ' . ($vars['_LANG'][$cData['lang']] ?? '');
+                                        if ($setupVal > 0) {
+                                            $setupLang = $vars['_LANG']['ordersetupfee'] ?? 'Setup Fee';
+                                            $cycleString .= ' + ' . formatCurrency($setupVal, $currencyId) . ' ' . $setupLang;
+                                        }
+                                        $pricing[$cycle] = $cycleString;
+                                        $pricing['cycles'][$cycle] = $cycleString;
+                                        
+                                        $enabledPrices[$cycle] = $priceVal;
+                                        $enabledSetups[$cycle] = $setupVal;
+                                    }
+                                }
+                                
+                                if (!empty($enabledPrices)) {
+                                    $minPriceVal = -1;
+                                    $minSetupVal = 0;
+                                    $cycleOrder = ['monthly', 'quarterly', 'semiannually', 'annually', 'biennially', 'triennially'];
+                                    foreach ($cycleOrder as $cycle) {
+                                        if (isset($enabledPrices[$cycle])) {
+                                            $minPriceVal = $enabledPrices[$cycle];
+                                            $minSetupVal = $enabledSetups[$cycle] ?? 0;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    if ($minPriceVal >= 0) {
+                                        $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+                                        if ($currencyObj) {
+                                            if (!is_array($pricing['minprice'] ?? null)) {
+                                                $pricing['minprice'] = [];
+                                            }
+                                            $pricing['minprice']['price'] = new \WHMCS\View\Formatter\Price($minPriceVal, $currencyObj);
+                                            $pricing['minprice']['setupFee'] = new \WHMCS\View\Formatter\Price($minSetupVal, $currencyObj);
+                                            
+                                            // Determine min price cycle term
+                                            $minCycle = 'monthly';
+                                            foreach ($cycleOrder as $cycle) {
+                                                if (isset($enabledPrices[$cycle]) && $enabledPrices[$cycle] == $minPriceVal) {
+                                                    $minCycle = $cycle;
+                                                    break;
+                                                }
+                                            }
+                                            $pricing['minprice']['cycle'] = $minCycle;
+                                            $pricing['minprice']['simple'] = formatCurrency($minPriceVal, $currencyId);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if ($isObj) {
+                                $product->pricing = $pricing;
+                            } else {
+                                $product['pricing'] = $pricing;
+                            }
+                        }
+                    }
+
+                    $filteredProducts[] = $product;
+                }
+                $overrides['products'] = $filteredProducts;
+            }
+
+            // Filter product groups (categories) lists to only show groups containing branded products
+            if (!empty($brandProductIds)) {
+                $brandGroupIds = [];
+                try {
+                    $brandGroupIds = Capsule::table('tblproducts')
+                        ->whereIn('id', $brandProductIds)
+                        ->pluck('gid')
+                        ->unique()
+                        ->toArray();
+                } catch (\Exception $e) {}
+
+                if (isset($vars['productgroups']) && is_array($vars['productgroups'])) {
+                    $filteredGroups = [];
+                    foreach ($vars['productgroups'] as $group) {
+                        $groupId = 0;
+                        if (is_array($group)) {
+                            $groupId = isset($group['id']) ? (int)$group['id'] : (isset($group['gid']) ? (int)$group['gid'] : 0);
+                        } elseif (is_object($group)) {
+                            $groupId = isset($group->id) ? (int)$group->id : (isset($group->gid) ? (int)$group->gid : 0);
+                        }
+                        if ($groupId > 0 && in_array($groupId, $brandGroupIds)) {
+                            $filteredGroups[] = $group;
+                        }
+                    }
+                    $overrides['productgroups'] = $filteredGroups;
+                }
+            }
+        }
+
+        // --- Brand-wise Client Area Data Filtering ---
+        $clientId = (int)($_SESSION['uid'] ?? 0);
+        if ($clientId > 0) {
+            try {
+                // Fetch brand mappings lists
+                $brandServiceIds = Capsule::table('mod_multibrand_service_brands')
+                    ->where('brand_id', $brand->id)
+                    ->pluck('service_id')
+                    ->toArray();
+
+                $brandInvoiceIds = Capsule::table('mod_multibrand_invoice_brands')
+                    ->where('brand_id', $brand->id)
+                    ->pluck('invoice_id')
+                    ->toArray();
+
+                $brandTicketIds = Capsule::table('mod_multibrand_ticket_brands')
+                    ->where('brand_id', $brand->id)
+                    ->pluck('ticket_id')
+                    ->toArray();
+
+                // Helper to filter items in list (handles arrays and objects)
+                $filterEntityList = function ($list, $allowedIds) {
+                    if (!is_array($list)) {
+                        return $list;
+                    }
+                    $filtered = [];
+                    foreach ($list as $item) {
+                        $id = 0;
+                        if (is_array($item)) {
+                            $id = isset($item['id']) ? (int)$item['id'] : 0;
+                        } elseif (is_object($item)) {
+                            $id = isset($item->id) ? (int)$item->id : 0;
+                        }
+                        if ($id > 0 && in_array($id, $allowedIds)) {
+                            $filtered[] = $item;
+                        }
+                    }
+                    return $filtered;
+                };
+
+                // Filter services lists
+                $serviceKeys = ['services', 'activeServices', 'activeservices', 'activeproducts', 'activeProducts'];
+                foreach ($serviceKeys as $key) {
+                    if (isset($vars[$key]) && is_array($vars[$key])) {
+                        $overrides[$key] = $filterEntityList($vars[$key], $brandServiceIds);
+                    }
+                }
+
+                // Filter invoices lists
+                $invoiceKeys = ['invoices', 'unpaidInvoices', 'unpaidinvoices', 'dueinvoices', 'dueInvoices', 'recentinvoices', 'recentInvoices'];
+                foreach ($invoiceKeys as $key) {
+                    if (isset($vars[$key]) && is_array($vars[$key])) {
+                        $overrides[$key] = $filterEntityList($vars[$key], $brandInvoiceIds);
+                    }
+                }
+
+                // Filter tickets lists
+                $ticketKeys = ['tickets', 'recentTickets', 'recenttickets', 'activeTickets', 'activetickets'];
+                foreach ($ticketKeys as $key) {
+                    if (isset($vars[$key]) && is_array($vars[$key])) {
+                        $overrides[$key] = $filterEntityList($vars[$key], $brandTicketIds);
+                    }
+                }
+
+
+
+                // Fetch statistics for matching brand
+                $stats = get_multibrand_client_stats($clientId, $brand->id);
+
+                if (isset($vars['clientsstats']) && is_array($vars['clientsstats'])) {
+                    $cStats = $vars['clientsstats'];
+
+                    $cStats['productsnumactive'] = $stats['active_services'];
+                    $cStats['productsnum'] = $stats['total_services'];
+                    $cStats['hostingnumactive'] = $stats['active_services'];
+                    $cStats['hostingnum'] = $stats['total_services'];
+                    $cStats['servicesnumactive'] = $stats['active_services'];
+                    $cStats['servicesnum'] = $stats['total_services'];
+
+                    $cStats['numunpaidinvoices'] = $stats['unpaid_invoices'];
+                    $cStats['numdueinvoices'] = $stats['unpaid_invoices'];
+                    $cStats['invoicesnumunpaid'] = $stats['unpaid_invoices'];
+                    $cStats['invoicesnum'] = $stats['total_invoices'];
+
+                    $cStats['numactivetickets'] = $stats['active_tickets'];
+                    $cStats['numtickets'] = $stats['total_tickets'];
+                    $cStats['ticketsnumactive'] = $stats['active_tickets'];
+
+                    $overrides['clientsstats'] = $cStats;
+                }
+
+                // Override pagination totalresults & counts for specific listing pages
+                $action = $_GET['action'] ?? '';
+                if ($filename == 'clientarea' && $action == 'services') {
+                    $overrides['totalresults'] = $stats['total_services'];
+                    $overrides['numservices'] = $stats['total_services'];
+                } elseif ($filename == 'clientarea' && $action == 'invoices') {
+                    $overrides['totalresults'] = $stats['total_invoices'];
+                    $overrides['numinvoices'] = $stats['total_invoices'];
+
+                    // Recalculate brand-wise unpaid balance for page context
+                    $brandUnpaidInvoices = Capsule::table('tblinvoices')
+                        ->join('mod_multibrand_invoice_brands', 'tblinvoices.id', '=', 'mod_multibrand_invoice_brands.invoice_id')
+                        ->where('tblinvoices.userid', $clientId)
+                        ->where('mod_multibrand_invoice_brands.brand_id', $brand->id)
+                        ->where('tblinvoices.status', 'Unpaid')
+                        ->select('tblinvoices.total', 'tblinvoices.credit')
+                        ->get();
+
+                    $brandTotalBalance = 0.00;
+                    foreach ($brandUnpaidInvoices as $inv) {
+                        $brandTotalBalance += (float)$inv->total - (float)($inv->credit ?? 0.00);
+                    }
+
+                    $client = Capsule::table('tblclients')->where('id', $clientId)->first();
+                    $currencyId = $client ? (int)$client->currency : 1;
+                    if (function_exists('formatCurrency')) {
+                        $brandBalanceFormatted = formatCurrency($brandTotalBalance, $currencyId);
+                    } else {
+                        $brandBalanceFormatted = '$' . number_format($brandTotalBalance, 2);
+                    }
+
+                    $overrides['totalbalance'] = $brandBalanceFormatted;
+                    $overrides['numdueinvoices'] = $stats['unpaid_invoices'];
+                    $overrides['numunpaidinvoices'] = $stats['unpaid_invoices'];
+                } elseif ($filename == 'supporttickets' && empty($action)) {
+                    $overrides['totalresults'] = $stats['total_tickets'];
+                    $overrides['numtickets'] = $stats['total_tickets'];
+                }
+            } catch (\Exception $e) {}
+        }
+
+        if (isset($GLOBALS['smarty']) && is_object($GLOBALS['smarty']) && method_exists($GLOBALS['smarty'], 'assign')) {
+            foreach ($overrides as $key => $value) {
+                $GLOBALS['smarty']->assign($key, $value);
+            }
+        }
         return $overrides;
+    }
+    return [];
+    } catch (\Throwable $t) {
+        // file_put_contents(__DIR__ . '/hook_errors.log', "ClientAreaPage Error: " . $t->getMessage() . "\n" . $t->getTraceAsString() . "\n", FILE_APPEND);
+        return [];
+    }
+});
+
+/**
+ * Client Area Primary Sidebar Hook
+ * Updates sidebar navigation badge counts (My Services, My Invoices, Support Tickets) dynamically
+ */
+add_hook('ClientAreaPrimarySidebar', 1, function ($primarySidebar) {
+    $brand = get_multibrand_active_brand();
+    $clientId = (int)($_SESSION['uid'] ?? 0);
+
+    if ($brand && $clientId > 0) {
+        $stats = get_multibrand_client_stats($clientId, $brand->id);
+
+        // 1. My Services / My Products sidebar
+        $servicesItem = $primarySidebar->getChild('My Services');
+        if ($servicesItem) {
+            $activeServicesChild = $servicesItem->getChild('Active Services') ?: $servicesItem->getChild('My Services');
+            if ($activeServicesChild) {
+                $activeServicesChild->setBadge($stats['active_services']);
+            }
+        }
+
+        // 2. My Invoices / Invoices sidebar
+        $invoicesItem = $primarySidebar->getChild('My Invoices');
+        if ($invoicesItem) {
+            $unpaidInvoicesChild = $invoicesItem->getChild('Unpaid Invoices') ?: $invoicesItem->getChild('My Invoices');
+            if ($unpaidInvoicesChild) {
+                $unpaidInvoicesChild->setBadge($stats['unpaid_invoices']);
+            }
+        }
+
+        // 3. Support / Tickets sidebar
+        $supportItem = $primarySidebar->getChild('Support');
+        if ($supportItem) {
+            $ticketsChild = $supportItem->getChild('Support Tickets') ?: $supportItem->getChild('Tickets');
+            if ($ticketsChild) {
+                $ticketsChild->setBadge($stats['active_tickets']);
+            }
+        }
+
+        // 4. Invoices Status Filter Sidebar
+        $invoicesStatusFilter = $primarySidebar->getChild('My Invoices Status Filter');
+        if ($invoicesStatusFilter) {
+            try {
+                $statusCounts = Capsule::table('tblinvoices')
+                    ->join('mod_multibrand_invoice_brands', 'tblinvoices.id', '=', 'mod_multibrand_invoice_brands.invoice_id')
+                    ->where('tblinvoices.userid', $clientId)
+                    ->where('mod_multibrand_invoice_brands.brand_id', $brand->id)
+                    ->select('tblinvoices.status', Capsule::raw('count(*) as count'))
+                    ->groupBy('tblinvoices.status')
+                    ->pluck('count', 'status')
+                    ->toArray();
+
+                foreach (['Paid', 'Unpaid', 'Cancelled', 'Refunded', 'Draft', 'Collections'] as $status) {
+                    $child = $invoicesStatusFilter->getChild($status);
+                    if ($child) {
+                        $count = isset($statusCounts[$status]) ? (int)$statusCounts[$status] : 0;
+                        $child->setBadge($count);
+                    }
+                }
+            } catch (\Exception $e) {}
+        }
+
+        // 5. My Invoices Summary Panel (header count and body text balance)
+        $invoicesSummary = $primarySidebar->getChild('My Invoices Summary');
+        if ($invoicesSummary) {
+            try {
+                // Header label: "X Invoices Due"
+                $invoicesSummary->setLabel($stats['unpaid_invoices'] . ' Invoices Due');
+
+                // Recalculate client-wide (total) unpaid count and formatted balance to replace in body
+                $clientTotalUnpaidCount = Capsule::table('tblinvoices')
+                    ->where('userid', $clientId)
+                    ->where('status', 'Unpaid')
+                    ->count();
+
+                $clientTotalUnpaidInvoices = Capsule::table('tblinvoices')
+                    ->where('userid', $clientId)
+                    ->where('status', 'Unpaid')
+                    ->select('total', 'credit')
+                    ->get();
+                $clientTotalBalance = 0.00;
+                foreach ($clientTotalUnpaidInvoices as $inv) {
+                    $clientTotalBalance += (float)$inv->total - (float)($inv->credit ?? 0.00);
+                }
+
+                $client = Capsule::table('tblclients')->where('id', $clientId)->first();
+                $currencyId = $client ? (int)$client->currency : 1;
+
+                if (function_exists('formatCurrency')) {
+                    $clientTotalBalanceFormatted = formatCurrency($clientTotalBalance, $currencyId);
+                } else {
+                    $clientTotalBalanceFormatted = '$' . number_format($clientTotalBalance, 2);
+                }
+
+                // Brand-specific unpaid balance
+                $brandUnpaidInvoices = Capsule::table('tblinvoices')
+                    ->join('mod_multibrand_invoice_brands', 'tblinvoices.id', '=', 'mod_multibrand_invoice_brands.invoice_id')
+                    ->where('tblinvoices.userid', $clientId)
+                    ->where('mod_multibrand_invoice_brands.brand_id', $brand->id)
+                    ->where('tblinvoices.status', 'Unpaid')
+                    ->select('tblinvoices.total', 'tblinvoices.credit')
+                    ->get();
+
+                $brandTotalBalance = 0.00;
+                foreach ($brandUnpaidInvoices as $inv) {
+                    $brandTotalBalance += (float)$inv->total - (float)($inv->credit ?? 0.00);
+                }
+
+                if (function_exists('formatCurrency')) {
+                    $brandBalanceFormatted = formatCurrency($brandTotalBalance, $currencyId);
+                } else {
+                    $brandBalanceFormatted = '$' . number_format($brandTotalBalance, 2);
+                }
+
+                // Clean swap in body HTML
+                $bodyHtml = $invoicesSummary->getBodyHtml();
+                if ($bodyHtml) {
+                    // String replace values
+                    $bodyHtml = str_replace((string)$clientTotalUnpaidCount, (string)$stats['unpaid_invoices'], $bodyHtml);
+                    $bodyHtml = str_replace($clientTotalBalanceFormatted, $brandBalanceFormatted, $bodyHtml);
+                    $invoicesSummary->setBodyHtml($bodyHtml);
+                }
+            } catch (\Exception $e) {}
+        }
+
+        // 6. Services Status Filter
+        $servicesStatusFilter = $primarySidebar->getChild('My Services Status Filter');
+        if ($servicesStatusFilter) {
+            try {
+                $statusCounts = Capsule::table('tblhosting')
+                    ->join('mod_multibrand_service_brands', 'tblhosting.id', '=', 'mod_multibrand_service_brands.service_id')
+                    ->where('tblhosting.userid', $clientId)
+                    ->where('mod_multibrand_service_brands.brand_id', $brand->id)
+                    ->select('tblhosting.domainstatus', Capsule::raw('count(*) as count'))
+                    ->groupBy('tblhosting.domainstatus')
+                    ->pluck('count', 'domainstatus')
+                    ->toArray();
+
+                foreach (['Active', 'Pending', 'Suspended', 'Terminated', 'Cancelled'] as $status) {
+                    $child = $servicesStatusFilter->getChild($status);
+                    if ($child) {
+                        $count = isset($statusCounts[$status]) ? (int)$statusCounts[$status] : 0;
+                        $child->setBadge($count);
+                    }
+                }
+            } catch (\Exception $e) {}
+        }
+
+        // 7. Ticket List Status Filter
+        $ticketStatusFilter = $primarySidebar->getChild('Ticket List Status Filter');
+        if ($ticketStatusFilter) {
+            try {
+                $statusCounts = Capsule::table('tbltickets')
+                    ->join('mod_multibrand_ticket_brands', 'tbltickets.id', '=', 'mod_multibrand_ticket_brands.ticket_id')
+                    ->where('tbltickets.userid', $clientId)
+                    ->where('mod_multibrand_ticket_brands.brand_id', $brand->id)
+                    ->select('tbltickets.status', Capsule::raw('count(*) as count'))
+                    ->groupBy('tbltickets.status')
+                    ->pluck('count', 'status')
+                    ->toArray();
+
+                foreach (['Open', 'Answered', 'Customer-Reply', 'Closed'] as $status) {
+                    $child = $ticketStatusFilter->getChild($status);
+                    if ($child) {
+                        $count = isset($statusCounts[$status]) ? (int)$statusCounts[$status] : 0;
+                        $child->setBadge($count);
+                    }
+                }
+            } catch (\Exception $e) {}
+        }
+    }
+});
+
+/**
+ * Client Area Secondary Sidebar Hook
+ * Updates secondary panel header badge counts dynamically
+ */
+add_hook('ClientAreaSecondarySidebar', 1, function ($secondarySidebar) {
+    $brand = get_multibrand_active_brand();
+    $clientId = (int)($_SESSION['uid'] ?? 0);
+
+    if ($brand && $clientId > 0) {
+        $stats = get_multibrand_client_stats($clientId, $brand->id);
+
+        foreach ($secondarySidebar->getChildren() as $panel) {
+            $panelName = strtolower($panel->getName());
+            if (strpos($panelName, 'service') !== false || strpos($panelName, 'product') !== false) {
+                $panel->setBadge($stats['active_services']);
+            } elseif (strpos($panelName, 'invoice') !== false || strpos($panelName, 'billing') !== false) {
+                $panel->setBadge($stats['unpaid_invoices']);
+            } elseif (strpos($panelName, 'ticket') !== false || strpos($panelName, 'support') !== false) {
+                $panel->setBadge($stats['active_tickets']);
+            }
+        }
     }
 });
 
@@ -365,11 +1059,204 @@ add_hook('ClientAreaPage', 1, function ($vars) {
  * Dynamically overrides the cart template matching the brand's order template
  */
 add_hook('OrderPage', 1, function ($vars) {
-    $brand = get_multibrand_active_brand();
-    if ($brand && $brand->order_template) {
-        return [
-            'carttemplate' => $brand->order_template
-        ];
+    try {
+        $brand = get_multibrand_active_brand();
+        $overrides = [];
+        // file_put_contents(__DIR__ . '/requested_filenames.log', "OrderPage Hook Executed! Brand ID: " . ($brand ? $brand->id : 'NONE') . " | CartTemplate Override: " . ($brand->order_template ?? 'NONE') . "\n", FILE_APPEND);
+        if ($brand && $brand->order_template) {
+            $overrides['carttemplate'] = $brand->order_template;
+        }
+
+        if ($brand && $brand->products_branding) {
+            $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+            $brandProductIds = isset($pricingOverrides['products']) ? array_keys($pricingOverrides['products']) : [];
+
+            // Filter products list for sale in current category and apply brand pricing overrides
+            if (isset($vars['products']) && is_array($vars['products'])) {
+                $filteredProducts = [];
+                foreach ($vars['products'] as $product) {
+                    $productId = 0;
+                    if (is_array($product)) {
+                        $productId = isset($product['id']) ? (int)$product['id'] : (isset($product['pid']) ? (int)$product['pid'] : 0);
+                    } elseif (is_object($product)) {
+                        $productId = isset($product->id) ? (int)$product->id : (isset($product->pid) ? (int)$product->pid : 0);
+                    }
+                    
+                    // Apply branding catalog visibility filter (if brand has attached products)
+                    if (!empty($brandProductIds) && !in_array($productId, $brandProductIds)) {
+                        continue;
+                    }
+
+                    // Apply brand pricing overrides if active
+                    if ($brand->price_override && $productId > 0) {
+                        $currencyId = (int)($vars['activeCurrency']['id'] ?? $_SESSION['currency'] ?? 1);
+                        $rates = $pricingOverrides['products'][$productId]['pricing'][$currencyId] ?? [];
+                        
+                        if (!empty($rates)) {
+                            $isObj = is_object($product);
+                            $paytype = $isObj ? ($product->paytype ?? '') : ($product['paytype'] ?? '');
+                            $pricing = $isObj ? (array)($product->pricing ?? []) : ($product['pricing'] ?? []);
+                            
+                            if ($paytype == 'onetime') {
+                                $newPrice = isset($rates['monthly']) && $rates['monthly'] !== '' ? (float)$rates['monthly'] : null;
+                                $newSetup = isset($rates['msetupfee']) && $rates['msetupfee'] !== '' ? (float)$rates['msetupfee'] : null;
+                                
+                                if ($newPrice !== null) {
+                                    $pricing['rawpricing']['monthly'] = number_format($newPrice, 2, '.', '');
+                                    $pricing['rawpricing']['simple'] = formatCurrency($newPrice, $currencyId);
+                                }
+                                if ($newSetup !== null) {
+                                    $pricing['rawpricing']['msetupfee'] = number_format($newSetup, 2, '.', '');
+                                }
+                                
+                                $priceVal = $newPrice !== null ? $newPrice : (float)($pricing['rawpricing']['monthly'] ?? 0);
+                                $setupVal = $newSetup !== null ? $newSetup : (float)($pricing['rawpricing']['msetupfee'] ?? 0);
+                                
+                                $onetimeString = formatCurrency($priceVal, $currencyId);
+                                if ($setupVal > 0) {
+                                    $setupLang = $vars['_LANG']['ordersetupfee'] ?? 'Setup Fee';
+                                    $onetimeString .= ' + ' . formatCurrency($setupVal, $currencyId) . ' ' . $setupLang;
+                                }
+                                $pricing['onetime'] = $onetimeString;
+                                $pricing['cycles']['onetime'] = $onetimeString;
+                                
+                                $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+                                if ($currencyObj) {
+                                    if (!is_array($pricing['minprice'] ?? null)) {
+                                        $pricing['minprice'] = [];
+                                    }
+                                    $pricing['minprice']['price'] = new \WHMCS\View\Formatter\Price($priceVal, $currencyObj);
+                                    $pricing['minprice']['setupFee'] = new \WHMCS\View\Formatter\Price($setupVal, $currencyObj);
+                                    $pricing['minprice']['cycle'] = 'onetime';
+                                    $pricing['minprice']['simple'] = formatCurrency($priceVal, $currencyId);
+                                }
+                            } elseif ($paytype == 'recurring') {
+                                $cyclesKeys = [
+                                    'monthly' => ['price' => 'monthly', 'setup' => 'msetupfee', 'lang' => 'orderpaymenttermmonthly'],
+                                    'quarterly' => ['price' => 'quarterly', 'setup' => 'qsetupfee', 'lang' => 'orderpaymenttermquarterly'],
+                                    'semiannually' => ['price' => 'semiannually', 'setup' => 'ssetupfee', 'lang' => 'orderpaymenttermsemiannually'],
+                                    'annually' => ['price' => 'annually', 'setup' => 'asetupfee', 'lang' => 'orderpaymenttermannually'],
+                                    'biennially' => ['price' => 'biennially', 'setup' => 'bsetupfee', 'lang' => 'orderpaymenttermbiennially'],
+                                    'triennially' => ['price' => 'triennially', 'setup' => 'tsetupfee', 'lang' => 'orderpaymenttermtriennially'],
+                                ];
+                                
+                                $enabledPrices = [];
+                                $enabledSetups = [];
+                                
+                                foreach ($cyclesKeys as $cycle => $cData) {
+                                    $origPrice = (float)($pricing['rawpricing'][$cycle] ?? -1.00);
+                                    if ($origPrice >= 0) {
+                                        $newPrice = isset($rates[$cData['price']]) && $rates[$cData['price']] !== '' ? (float)$rates[$cData['price']] : null;
+                                        $newSetup = isset($rates[$cData['setup']]) && $rates[$cData['setup']] !== '' ? (float)$rates[$cData['setup']] : null;
+                                        
+                                        if ($newPrice !== null) {
+                                            $pricing['rawpricing'][$cycle] = number_format($newPrice, 2, '.', '');
+                                        }
+                                        if ($newSetup !== null) {
+                                            $pricing['rawpricing'][$cData['setup']] = number_format($newSetup, 2, '.', '');
+                                        }
+                                        
+                                        $priceVal = $newPrice !== null ? $newPrice : $origPrice;
+                                        $setupVal = $newSetup !== null ? $newSetup : (float)($pricing['rawpricing'][$cData['setup']] ?? 0);
+                                        
+                                        $cycleString = formatCurrency($priceVal, $currencyId) . ' ' . ($vars['_LANG'][$cData['lang']] ?? '');
+                                        if ($setupVal > 0) {
+                                            $setupLang = $vars['_LANG']['ordersetupfee'] ?? 'Setup Fee';
+                                            $cycleString .= ' + ' . formatCurrency($setupVal, $currencyId) . ' ' . $setupLang;
+                                        }
+                                        $pricing[$cycle] = $cycleString;
+                                        $pricing['cycles'][$cycle] = $cycleString;
+                                        
+                                        $enabledPrices[$cycle] = $priceVal;
+                                        $enabledSetups[$cycle] = $setupVal;
+                                    }
+                                }
+                                
+                                if (!empty($enabledPrices)) {
+                                    $minPriceVal = -1;
+                                    $minSetupVal = 0;
+                                    $cycleOrder = ['monthly', 'quarterly', 'semiannually', 'annually', 'biennially', 'triennially'];
+                                    foreach ($cycleOrder as $cycle) {
+                                        if (isset($enabledPrices[$cycle])) {
+                                            $minPriceVal = $enabledPrices[$cycle];
+                                            $minSetupVal = $enabledSetups[$cycle] ?? 0;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    if ($minPriceVal >= 0) {
+                                        $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+                                        if ($currencyObj) {
+                                            if (!is_array($pricing['minprice'] ?? null)) {
+                                                $pricing['minprice'] = [];
+                                            }
+                                            $pricing['minprice']['price'] = new \WHMCS\View\Formatter\Price($minPriceVal, $currencyObj);
+                                            $pricing['minprice']['setupFee'] = new \WHMCS\View\Formatter\Price($minSetupVal, $currencyObj);
+                                            
+                                            $minCycle = 'monthly';
+                                            foreach ($cycleOrder as $cycle) {
+                                                if (isset($enabledPrices[$cycle]) && $enabledPrices[$cycle] == $minPriceVal) {
+                                                    $minCycle = $cycle;
+                                                    break;
+                                                }
+                                            }
+                                            $pricing['minprice']['cycle'] = $minCycle;
+                                            $pricing['minprice']['simple'] = formatCurrency($minPriceVal, $currencyId);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if ($isObj) {
+                                $product->pricing = $pricing;
+                            } else {
+                                $product['pricing'] = $pricing;
+                            }
+                        }
+                    }
+
+                    $filteredProducts[] = $product;
+                }
+                $overrides['products'] = $filteredProducts;
+            }
+
+            // Filter product groups (categories)
+            if (!empty($brandProductIds) && isset($vars['productgroups']) && is_array($vars['productgroups'])) {
+                $brandGroupIds = [];
+                try {
+                    $brandGroupIds = Capsule::table('tblproducts')
+                        ->whereIn('id', $brandProductIds)
+                        ->pluck('gid')
+                        ->unique()
+                        ->toArray();
+                } catch (\Exception $e) {}
+
+                $filteredGroups = [];
+                foreach ($vars['productgroups'] as $group) {
+                    $groupId = 0;
+                    if (is_array($group)) {
+                        $groupId = isset($group['id']) ? (int)$group['id'] : (isset($group['gid']) ? (int)$group['gid'] : 0);
+                    } elseif (is_object($group)) {
+                        $groupId = isset($group->id) ? (int)$group->id : (isset($group->gid) ? (int)$group->gid : 0);
+                    }
+                    if ($groupId > 0 && in_array($groupId, $brandGroupIds)) {
+                        $filteredGroups[] = $group;
+                    }
+                }
+                $overrides['productgroups'] = $filteredGroups;
+            }
+        }
+
+        if (isset($GLOBALS['smarty']) && is_object($GLOBALS['smarty']) && method_exists($GLOBALS['smarty'], 'assign')) {
+            foreach ($overrides as $key => $value) {
+                $GLOBALS['smarty']->assign($key, $value);
+            }
+        }
+
+        return $overrides;
+    } catch (\Throwable $t) {
+        // file_put_contents(__DIR__ . '/hook_errors.log', "OrderPage Error: " . $t->getMessage() . "\n" . $t->getTraceAsString() . "\n", FILE_APPEND);
+        return [];
     }
 });
 
@@ -431,7 +1318,7 @@ add_hook('ClientAreaPrimaryNavbar', 1, function ($primaryNavbar) {
             ->join('mod_multibrand_brands', 'mod_multibrand_client_brands.brand_id', '=', 'mod_multibrand_brands.id')
             ->where('mod_multibrand_client_brands.client_id', $loggedInClientId)
             ->where('mod_multibrand_brands.status', 1)
-            ->select('mod_multibrand_brands.brand_name', 'mod_multibrand_brands.system_url', 'mod_multibrand_brands.domain')
+            ->select('mod_multibrand_brands.id', 'mod_multibrand_brands.brand_name', 'mod_multibrand_brands.system_url', 'mod_multibrand_brands.domain')
             ->get();
             
         if ($assignedBrands->count() > 1) {
@@ -441,10 +1328,30 @@ add_hook('ClientAreaPrimaryNavbar', 1, function ($primaryNavbar) {
                 'uri' => '#',
                 'order' => 90, // Places it next to account settings
             ]);
-            $brandsMenu->setDropdown(true);
             
             foreach ($assignedBrands as $ab) {
-                $url = $ab->system_url ?: ($ab->domain ? 'http://' . $ab->domain : '#');
+                // Determine switcher URL
+                $requestHost = strtolower($_SERVER['SERVER_NAME'] ?? '');
+                $requestHostClean = ltrim($requestHost, 'www.');
+                
+                $brandHostClean = '';
+                if ($ab->domain) {
+                    $brandHost = strtolower(parse_url($ab->system_url ?: 'http://' . $ab->domain, PHP_URL_HOST));
+                    $brandHostClean = ltrim($brandHost, 'www.');
+                }
+                
+                if (empty($brandHostClean) || $brandHostClean === $requestHostClean) {
+                    // Same domain: switch context via query parameter on current script
+                    $scriptName = basename($_SERVER['SCRIPT_NAME'] ?? 'clientarea.php');
+                    if ($scriptName === 'viewinvoice.php') {
+                        $scriptName = 'clientarea.php';
+                    }
+                    $url = $scriptName . '?brand_switch=' . $ab->id;
+                } else {
+                    // Different domain: redirect directly to the brand's home domain
+                    $url = $ab->system_url ?: ($ab->domain ? 'http://' . $ab->domain : '#');
+                }
+                
                 $brandsMenu->addChild($ab->brand_name, [
                     'label' => $ab->brand_name,
                     'uri' => $url,
@@ -453,6 +1360,14 @@ add_hook('ClientAreaPrimaryNavbar', 1, function ($primaryNavbar) {
             }
         }
     } catch (\Exception $e) {}
+});
+
+/**
+ * Client Logout Hook
+ * Clears active brand context overrides on logout
+ */
+add_hook('ClientLogout', 1, function ($vars) {
+    unset($_SESSION['multibrand_brand_id']);
 });
 
 /**
@@ -677,24 +1592,6 @@ add_hook('EmailPreSend', 1, function ($vars) {
                 }
             } catch (\Exception $e) {}
         }
-        // Domain emails
-        elseif (stripos($messagename, 'Domain') !== false) {
-            try {
-                $domainBrand = \WHMCS\Database\Capsule::table('mod_multibrand_domain_brands')->where('domain_id', $relid)->first();
-                if ($domainBrand) {
-                    $resolvedBrandId = $domainBrand->brand_id;
-                } else {
-                    $domain = \WHMCS\Database\Capsule::table('tbldomains')->where('id', $relid)->first();
-                    if ($domain) {
-                        $clientBrand = \WHMCS\Database\Capsule::table('mod_multibrand_client_brands')->where('client_id', $domain->userid)->first();
-                        if ($clientBrand) {
-                            $resolvedBrandId = $clientBrand->brand_id;
-                        }
-                    }
-                }
-            } catch (\Exception $e) {}
-        }
-
         // Fallback: If $relid is a client ID directly
         if ($resolvedBrandId === 0) {
             try {
@@ -846,40 +1743,40 @@ add_hook('ClientAreaHeadOutput', 1, function ($vars) {
         $html = '<!-- Multi Brand Applied: ' . htmlspecialchars($brand->brand_name) . ' -->';
         
         // Inject brand custom color and logo stylesheet dynamically
-        if ($brand->brand_color) {
-            $color = htmlspecialchars($brand->brand_color);
-            $html .= "
-            <style>
-                /* Root CSS Custom Properties override for modern templates (e.g. Twenty One) */
-                :root {
-                    --primary-color: $color !important;
-                    --primary: $color !important;
-                    --primary-bg-color: $color !important;
-                    --brand-color: $color !important;
-                }
-                /* Auto-injected Premium Brand Colors */
-                .navbar-main, .navbar-default, .primary-nav, .brand-color-bg, .navbar-main .navbar-nav > li > a:hover {
-                    background-color: $color !important;
-                    border-color: $color !important;
-                }
-                .btn-primary, .btn-primary:hover, .btn-primary:focus, .btn-primary:active, .btn-primary.active, .btn-info, .btn-info:hover {
-                    background-color: $color !important;
-                    border-color: $color !important;
-                }
-                a, a:hover, a:focus, .text-primary, .navbar-main .navbar-nav > .active > a, .navbar-main .navbar-nav > .active > a:hover {
-                    color: $color !important;
-                }
-                .sidebar .panel-header, .panel-primary > .panel-heading, .panel-primary, .panel-sidebar > .panel-heading, .list-group-item.active, .list-group-item.active:hover, .list-group-item.active:focus {
-                    background-color: $color !important;
-                    border-color: $color !important;
-                }
-                /* Dynamic visual accents */
-                .label-primary, .badge-primary, .badge-info, .label-info {
-                    background-color: $color !important;
-                }
-            </style>
-            ";
-        }
+        // if ($brand->brand_color) {
+        //     $color = htmlspecialchars($brand->brand_color);
+        //     $html .= "
+        //     <style>
+        //         /* Root CSS Custom Properties override for modern templates (e.g. Twenty One) */
+        //         :root {
+        //             --primary-color: $color !important;
+        //             --primary: $color !important;
+        //             --primary-bg-color: $color !important;
+        //             --brand-color: $color !important;
+        //         }
+        //         /* Auto-injected Premium Brand Colors */
+        //         .navbar-main, .navbar-default, .primary-nav, .brand-color-bg, .navbar-main .navbar-nav > li > a:hover {
+        //             background-color: $color !important;
+        //             border-color: $color !important;
+        //         }
+        //         .btn-primary, .btn-primary:hover, .btn-primary:focus, .btn-primary:active, .btn-primary.active, .btn-info, .btn-info:hover {
+        //             background-color: $color !important;
+        //             border-color: $color !important;
+        //         }
+        //         a, a:hover, a:focus, .text-primary, .navbar-main .navbar-nav > .active > a, .navbar-main .navbar-nav > .active > a:hover {
+        //             color: $color !important;
+        //         }
+        //         .sidebar .panel-header, .panel-primary > .panel-heading, .panel-primary, .panel-sidebar > .panel-heading, .list-group-item.active, .list-group-item.active:hover, .list-group-item.active:focus {
+        //             background-color: $color !important;
+        //             border-color: $color !important;
+        //         }
+        //         /* Dynamic visual accents */
+        //         .label-primary, .badge-primary, .badge-info, .label-info {
+        //             background-color: $color !important;
+        //         }
+        //     </style>
+        //     ";
+        // }
         
         if ($brand->logo_url) {
             $logo = htmlspecialchars($brand->logo_url);
@@ -2786,28 +3683,79 @@ add_hook('UpdateInvoiceTotal', 1, function ($vars) {
 add_hook('InvoiceCreated', 1, function ($vars) {
     $invoiceId = (int)$vars['invoiceid'];
     try {
-        // Find the invoice details to get the client ID
-        $invoice = Capsule::table('tblinvoices')->find($invoiceId);
-        if ($invoice && $invoice->userid) {
-            // Find the client's first assigned brand
-            $clientBrand = Capsule::table('mod_multibrand_client_brands')
-                ->where('client_id', $invoice->userid)
-                ->first();
+        $brandId = 0;
+
+        // 1. Try to find brand from associated invoice items (renewal/services/domains)
+        $items = Capsule::table('tblinvoiceitems')->where('invoiceid', $invoiceId)->get();
+        foreach ($items as $item) {
+            if (in_array($item->type, ['Hosting', 'Service']) && $item->relid > 0) {
+                $sb = Capsule::table('mod_multibrand_service_brands')->where('service_id', $item->relid)->first();
+                if ($sb && $sb->brand_id > 0) {
+                    $brandId = $sb->brand_id;
+                    break;
+                }
+            } elseif ($item->type == 'Addon' && $item->relid > 0) {
+                $addon = Capsule::table('tblhostingaddons')->find($item->relid);
+                if ($addon && $addon->hostingid > 0) {
+                    $sb = Capsule::table('mod_multibrand_service_brands')->where('service_id', $addon->hostingid)->first();
+                    if ($sb && $sb->brand_id > 0) {
+                        $brandId = $sb->brand_id;
+                        break;
+                    }
+                }
+            } elseif ($item->type == 'Upgrade' && $item->relid > 0) {
+                $upgrade = Capsule::table('tblupgrades')->find($item->relid);
+                if ($upgrade && $upgrade->relid > 0) {
+                    $sb = Capsule::table('mod_multibrand_service_brands')->where('service_id', $upgrade->relid)->first();
+                    if ($sb && $sb->brand_id > 0) {
+                        $brandId = $sb->brand_id;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 2. Fall back to current active request brand if we are in frontend context
+        if ($brandId === 0 && !defined('ADMIN_AREA')) {
+            $activeBrand = get_multibrand_active_brand();
+            if ($activeBrand) {
+                $brandId = $activeBrand->id;
+            }
+        }
+
+        // 3. Fall back to the client's first assigned brand
+        if ($brandId === 0) {
+            $invoice = Capsule::table('tblinvoices')->find($invoiceId);
+            if ($invoice && $invoice->userid) {
+                $clientBrand = Capsule::table('mod_multibrand_client_brands')
+                    ->where('client_id', $invoice->userid)
+                    ->first();
+                if ($clientBrand) {
+                    $brandId = $clientBrand->brand_id;
+                }
+            }
+        }
+
+        // 4. Update or insert the invoice brand mapping
+        if ($brandId > 0) {
+            $exists = Capsule::table('mod_multibrand_invoice_brands')
+                ->where('invoice_id', $invoiceId)
+                ->exists();
                 
-            if ($clientBrand) {
-                // Check if mapping already exists to avoid duplicates
-                $exists = Capsule::table('mod_multibrand_invoice_brands')
+            if ($exists) {
+                Capsule::table('mod_multibrand_invoice_brands')
                     ->where('invoice_id', $invoiceId)
-                    ->exists();
-                    
-                if (!$exists) {
-                    Capsule::table('mod_multibrand_invoice_brands')->insert([
-                        'invoice_id' => $invoiceId,
-                        'brand_id' => $clientBrand->brand_id,
-                        'created_at' => date('Y-m-d H:i:s'),
+                    ->update([
+                        'brand_id' => $brandId,
                         'updated_at' => date('Y-m-d H:i:s')
                     ]);
-                }
+            } else {
+                Capsule::table('mod_multibrand_invoice_brands')->insert([
+                    'invoice_id' => $invoiceId,
+                    'brand_id' => $brandId,
+                    'created_at' => date('Y-m-d H:i:s'),
+                    'updated_at' => date('Y-m-d H:i:s')
+                ]);
             }
         }
     } catch (\Exception $e) {
@@ -2864,7 +3812,7 @@ add_hook('DownloadAdd', 1, function ($vars) {
  * Saves brand assignment when a new order is created
  */
 add_hook('AfterShoppingCartCheckout', 1, function ($vars) {
-    // print_r($vars);die();
+    // print_r($_POST);die();
     $orderId = (int)$vars['OrderID'];
     if ($orderId > 0) {
         $brandId = 0;
@@ -2896,6 +3844,28 @@ add_hook('AfterShoppingCartCheckout', 1, function ($vars) {
                     if (!$serviceExists) {
                         Capsule::table('mod_multibrand_service_brands')->insert([
                             'service_id' => $service->id,
+                            'brand_id' => $brandId,
+                            'created_at' => date('Y-m-d H:i:s'),
+                            'updated_at' => date('Y-m-d H:i:s')
+                        ]);
+                    }
+                }
+
+                // Associate the checkout invoice to the same brand
+                $order = Capsule::table('tblorders')->find($orderId);
+                if ($order && $order->invoiceid > 0) {
+                    $invoiceId = (int)$order->invoiceid;
+                    $invExists = Capsule::table('mod_multibrand_invoice_brands')->where('invoice_id', $invoiceId)->exists();
+                    if ($invExists) {
+                        Capsule::table('mod_multibrand_invoice_brands')
+                            ->where('invoice_id', $invoiceId)
+                            ->update([
+                                'brand_id' => $brandId,
+                                'updated_at' => date('Y-m-d H:i:s')
+                            ]);
+                    } else {
+                        Capsule::table('mod_multibrand_invoice_brands')->insert([
+                            'invoice_id' => $invoiceId,
                             'brand_id' => $brandId,
                             'created_at' => date('Y-m-d H:i:s'),
                             'updated_at' => date('Y-m-d H:i:s')
@@ -3003,6 +3973,7 @@ add_hook('TicketOpenAdmin', 1, function ($vars) {
 /**
  * Helper to save ticket brand association
  */
+if (!function_exists('multibrand_save_ticket_brand')) {
 function multibrand_save_ticket_brand($vars) {
     $ticketId = (int)$vars['ticketid'];
     if ($ticketId > 0) {
@@ -3042,6 +4013,7 @@ function multibrand_save_ticket_brand($vars) {
             }
         } catch (\Exception $e) {}
     }
+}
 }
 
 /**
@@ -3189,6 +4161,7 @@ add_hook('OrderDomainPricingOverride', 1, function ($vars) {
 /**
  * Dynamic Payment Gateway Overrides for Multi Brand Addon
  */
+if (!function_exists('get_multibrand_request_brand')) {
 function get_multibrand_request_brand()
 {
     static $brand = null;
@@ -3228,7 +4201,9 @@ function get_multibrand_request_brand()
         return get_multibrand_active_brand();
     }
 }
+}
 
+if (!function_exists('apply_brand_gateway_overrides')) {
 function apply_brand_gateway_overrides($brand)
 {
     if (!$brand || !$brand->payment_gateways) {
@@ -3310,6 +4285,7 @@ function apply_brand_gateway_overrides($brand)
             }
         });
     }
+}
 }
 
 // Runtime Execution on Frontend
