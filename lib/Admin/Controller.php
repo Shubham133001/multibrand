@@ -112,7 +112,7 @@ class Controller
             </a>
         </div>';
 
-        $output .= '<table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
+        $output .= '<table class="' . (count($brands) > 0 ? 'datatable' : 'table-no-datatable') . '" width="100%" border="0" cellspacing="1" cellpadding="3">
             <thead>
                 <tr>
                     <th>Brand Name</th>
@@ -191,6 +191,10 @@ class Controller
         $id = (int) $_REQUEST['id'];
         $modulelink = $vars['modulelink'];
         $brand = Capsule::table('mod_multibrand_brands')->where('id', $id)->first();
+        $activeTab = isset($_REQUEST['active_tab']) ? $_REQUEST['active_tab'] : '#set-general';
+        if (!in_array($activeTab, ['#set-general', '#set-billing', '#set-gateways', '#set-smtp', '#set-emails', '#set-maintenance'])) {
+            $activeTab = '#set-general';
+        }
 
         if (!$brand) {
             return '<div class="alert alert-danger">Brand not found.</div>' . $this->index($vars);
@@ -708,23 +712,23 @@ class Controller
         } catch (\Exception $e) {}
 
         $thisMonthSale = 0;
-        if (!empty($clientIds)) {
-            try {
-                $thisMonthSale = Capsule::table('tblinvoices')
-                    ->whereIn('userid', $clientIds)
-                    ->where('date', '>=', date('Y-m-01'))
-                    ->sum('total');
-            } catch (\Exception $e) {}
-        }
+        try {
+            $thisMonthSale = Capsule::table('tblinvoices')
+                ->join('mod_multibrand_invoice_brands', 'tblinvoices.id', '=', 'mod_multibrand_invoice_brands.invoice_id')
+                ->where('mod_multibrand_invoice_brands.brand_id', $brand->id)
+                ->where('tblinvoices.status', 'Paid')
+                ->where('tblinvoices.date', '>=', date('Y-m-01'))
+                ->sum('tblinvoices.total');
+        } catch (\Exception $e) {}
 
         $allTimeSale = 0;
-        if (!empty($clientIds)) {
-            try {
-                $allTimeSale = Capsule::table('tblinvoices')
-                    ->whereIn('userid', $clientIds)
-                    ->sum('total');
-            } catch (\Exception $e) {}
-        }
+        try {
+            $allTimeSale = Capsule::table('tblinvoices')
+                ->join('mod_multibrand_invoice_brands', 'tblinvoices.id', '=', 'mod_multibrand_invoice_brands.invoice_id')
+                ->where('mod_multibrand_invoice_brands.brand_id', $brand->id)
+                ->where('tblinvoices.status', 'Paid')
+                ->sum('tblinvoices.total');
+        } catch (\Exception $e) {}
 
         $thisMonthSaleFormatted = '$' . number_format($thisMonthSale, 2) . ' USD';
         $allTimeSaleFormatted = '$' . number_format($allTimeSale, 2) . ' USD';
@@ -1195,7 +1199,7 @@ class Controller
         <form method="post" action="' . $modulelink . '&action=save" enctype="multipart/form-data" novalidate>
             <input type="hidden" name="id" value="' . $brand->id . '">
             <input type="hidden" name="status_submitted" value="1">
-            
+             <input type="hidden" name="active_tab" id="active_tab" value="' . htmlspecialchars($activeTab) . '">
             <!-- TOP ROW (BRAND INFORMATION & SETTINGS) -->
             <div style="display: flex; flex-wrap: wrap; gap: 25px; margin-bottom: 30px; font-family: \'Outfit\', \'Segoe UI\', sans-serif;">
                 
@@ -1254,18 +1258,18 @@ class Controller
                         <div style="padding: 10px 20px; border-bottom: 1px solid #f0f0f0; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
                             <span style="font-weight: bold; color: ' . $brandColor . '; text-transform: uppercase; font-size: 0.95em;"><i class="fas fa-cog" style="margin-right: 8px;"></i> Settings</span>
                             <ul class="nav nav-tabs" style="border-bottom: none; margin: 0;">
-                                <li class="active"><a href="#set-general" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">General</a></li>
-                                <li><a href="#set-billing" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">Billing</a></li>
-                                <li><a href="#set-gateways" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">Payment Gateways</a></li>
-                                <li><a href="#set-smtp" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">SMTP</a></li>
-                                <li><a href="#set-emails" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">Email Templates</a></li>
-                                <li><a href="#set-maintenance" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">Maintenance</a></li>
+                                <li class="' . ($activeTab == '#set-general' ? 'active' : '') . '"><a href="#set-general" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">General</a></li>
+                                <li class="' . ($activeTab == '#set-billing' ? 'active' : '') . '"><a href="#set-billing" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">Billing</a></li>
+                                <li class="' . ($activeTab == '#set-gateways' ? 'active' : '') . '"><a href="#set-gateways" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">Payment Gateways</a></li>
+                                <li class="' . ($activeTab == '#set-smtp' ? 'active' : '') . '"><a href="#set-smtp" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">SMTP</a></li>
+                                <li class="' . ($activeTab == '#set-emails' ? 'active' : '') . '"><a href="#set-emails" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">Email Templates</a></li>
+                                <li class="' . ($activeTab == '#set-maintenance' ? 'active' : '') . '"><a href="#set-maintenance" data-toggle="tab" style="padding: 8px 12px; border: none; font-weight: 600; font-size: 0.88em; background: transparent;">Maintenance</a></li>
                             </ul>
                         </div>
                         
                         <div class="tab-content" style="padding: 25px; flex-grow: 1;">
                             <!-- GENERAL TAB -->
-                            <div class="tab-pane active" id="set-general" style="padding-top: 10px;">
+                            <div class="tab-pane ' . ($activeTab == '#set-general' ? 'active' : '') . '" id="set-general" style="padding-top: 10px;">
                                 
                                 <!-- Row 1 -->
                                 <div style="display: flex !important; justify-content: space-between !important; margin-bottom: 20px !important; width: 100% !important; align-items: flex-start !important;">
@@ -1560,7 +1564,7 @@ class Controller
                             </div>
                             
                             <!-- BILLING TAB -->
-                            <div class="tab-pane" id="set-billing">
+                           <div class="tab-pane ' . ($activeTab == '#set-billing' ? 'active' : '') . '" id="set-billing">
                                 <div style="display: flex; flex-wrap: wrap; gap: 30px;">
                                     
                                     <!-- Left Column -->
@@ -1628,8 +1632,8 @@ class Controller
                                         
                                         <div style="margin-bottom: 20px;">
                                             <div style="font-weight: 600; color: #555; margin-bottom: 5px; font-size: 0.95em;">Next Sequential Number</div>
-                                            <input type="number" name="next_sequential_number" value="' . htmlspecialchars($brand->next_sequential_number !== null ? $brand->next_sequential_number : '') . '" class="form-control" style="width: 100%;">
-                                            <div style="font-size: 0.85em; color: #888; margin-top: 5px;">Change this option only if you want to reset the automatic sequential numbering.</div>
+                                              <input type="number" name="next_sequential_number" value="' . ($brand->next_sequential_number !== null ? $brand->next_sequential_number : '') . '" placeholder="' . ($brand->next_sequential_number !== null ? $brand->next_sequential_number : '') . '" class="form-control" style="width: 100%;">
+                                            <div style="font-size: 0.85em; color: #888; margin-top: 5px;">Change this option only if you want to reset the automatic sequential numbering. Otherwise, leave empty.</div>
                                         </div>
                                         
                                         <div style="margin-bottom: 20px;">
@@ -1675,7 +1679,7 @@ class Controller
                             </div>
                             
                             <!-- PAYMENT GATEWAYS TAB -->
-                            <div class="tab-pane" id="set-gateways">
+                             <div class="tab-pane ' . ($activeTab == '#set-gateways' ? 'active' : '') . '" id="set-gateways">
                                 <h4 style="margin: 0 0 15px 0; font-weight: bold; color: ' . $brandColor . '; text-transform: uppercase; font-size: 1.1em;"><i class="fas fa-credit-card" style="margin-right: 8px;"></i> Payment Gateways</h4>
                                 <textarea name="payment_gateways" id="payment_gateways_json" style="display:none;">' . htmlspecialchars(htmlspecialchars_decode($brand->payment_gateways ?: '[]')) . '</textarea>
                                 
@@ -2011,7 +2015,7 @@ class Controller
                             </div>
                             
                             <!-- SMTP TAB -->
-                            <div class="tab-pane" id="set-smtp">
+                            <div class="tab-pane ' . ($activeTab == '#set-smtp' ? 'active' : '') . '" id="set-smtp">
                                 <h4 style="margin: 0 0 15px 0; font-weight: bold; color: ' . $brandColor . '; text-transform: uppercase; font-size: 1.1em;"><i class="fas fa-paper-plane" style="margin-right: 8px;"></i> SMTP Configuration</h4>
                                 <p style="color: #777; font-size: 0.9em; line-height: 1.5; margin-bottom: 25px;">
                                     If you would like your brand to use an outgoing email configuration which is different from the one in the main WHMCS settings, you can do it here.<br>
@@ -2211,12 +2215,12 @@ class Controller
                             </div>
                             
                             <!-- EMAIL TEMPLATES TAB -->
-                            <div class="tab-pane" id="set-emails">
+                             <div class="tab-pane ' . ($activeTab == '#set-emails' ? 'active' : '') . '" id="set-emails">
                                 ' . $emailTemplatesHtml . '
                             </div>
                             
                             <!-- MAINTENANCE TAB -->
-                            <div class="tab-pane" id="set-maintenance">
+                            <div class="tab-pane ' . ($activeTab == '#set-maintenance' ? 'active' : '') . '" id="set-maintenance">
                                 <div style="margin-bottom: 25px; display: flex; align-items: flex-start; gap: 15px;">
                                     <label class="mb-switch" style="flex-shrink: 0;">
                                         <input type="checkbox" name="maintenance_mode" value="1" ' . ($brand->maintenance_mode ? 'checked' : '') . ' onchange="var bdg = this.parentElement.nextElementSibling.querySelector(\'.status-badge\'); bdg.textContent = this.checked ? \'Enabled\' : \'Disabled\'; bdg.style.backgroundColor = this.checked ? \'#5cb85c\' : \'#777\';">
@@ -2660,15 +2664,6 @@ class Controller
                                     <option value="paypal" data-whmcs="false">PayPal</option>
                                     <option value="paypalrest" data-whmcs="false">PayPal REST</option>
                                     <option value="stripe" data-whmcs="false">Stripe</option>
-                                </optgroup>
-                                <optgroup label="WHMCS Gateways">';
-                                foreach ($whmcsGateways as $gw) {
-                                    if (in_array($gw->gateway, ['paypal', 'stripe'])) {
-                                        continue;
-                                    }
-                                    $output .= '<option value="' . htmlspecialchars($gw->gateway) . '" data-whmcs="true">' . htmlspecialchars($gw->value) . ' (WHMCS)</option>';
-                                }
-        $output .= '
                                 </optgroup>
                             </select>
                         </div>
@@ -3938,6 +3933,13 @@ class Controller
         </div>
         
         <script type="text/javascript">
+        // Strip datatable class from empty tables immediately to prevent DataTable crash
+        jQuery("table.datatable").each(function() {
+            if (jQuery(this).find("tbody td[colspan]").length > 0) {
+                jQuery(this).removeClass("datatable");
+            }
+        });
+
         jQuery(document).ready(function() {
             if (jQuery.fn.select2) {
                 jQuery(\'select[name="ticket_departments[]"]\').select2({
@@ -3964,6 +3966,7 @@ class Controller
                         }
                     });
                 }
+            });
         });
         </script>';
 
@@ -4824,6 +4827,13 @@ class Controller
 
         <script>
         $(document).ready(function() {
+        // Keep active tab state on form submit
+            jQuery(\'a[data-toggle="tab"]\').on(\'shown.bs.tab\', function (e) {
+                var target = jQuery(e.target).attr("href");
+                 if (target && target.indexOf("#set-") === 0) {
+                    jQuery(\'#active_tab\').val(target);
+                }
+            });
             // Select All Checkboxes toggle for emails
             $(document).on("click", "#email-select-all", function() {
                 var checked = this.checked;
@@ -5215,7 +5225,7 @@ class Controller
             'invoice_number_branding' => isset($_POST['invoice_number_branding']) ? 1 : 0,
             'zero_invoices_number_branding' => isset($_POST['zero_invoices_number_branding']) ? 1 : 0,
             'sequential_invoice_number_format' => $_POST['sequential_invoice_number_format'],
-            'next_sequential_number' => isset($_POST['next_sequential_number']) && $_POST['next_sequential_number'] !== '' ? (int) $_POST['next_sequential_number'] : null,
+            // 'next_sequential_number' => isset($_POST['next_sequential_number']) && $_POST['next_sequential_number'] !== '' ? (int) $_POST['next_sequential_number'] : null,
             'brand_currencies' => isset($_POST['brand_currencies']) && is_array($_POST['brand_currencies']) ? implode(',', $_POST['brand_currencies']) : '',
             'default_currency' => $_POST['default_currency'],
             'system_url' => $_POST['system_url'],
@@ -5254,7 +5264,9 @@ class Controller
             ]),
             'updated_at' => date('Y-m-d H:i:s'),
         ];
-
+           if (isset($_POST['next_sequential_number']) && $_POST['next_sequential_number'] !== '') {
+            $data['next_sequential_number'] = (int) $_POST['next_sequential_number'];
+        }
         // Handle Logo Upload
         if (isset($_FILES['logo_upload']) && $_FILES['logo_upload']['name'] != '') {
             $logoError = '';
@@ -6267,6 +6279,13 @@ class Controller
 
         $output .= '
         <script>
+        // Strip datatable class from empty tables immediately to prevent DataTable crash
+        jQuery("table.datatable").each(function() {
+            if (jQuery(this).find("tbody td[colspan]").length > 0) {
+                jQuery(this).removeClass("datatable");
+            }
+        });
+
         jQuery(document).ready(function() {
             // Assign Client Type toggle
             jQuery(document).on("change", "select[name=\"type\"]", function() {
@@ -9404,7 +9423,11 @@ class Controller
             exit;
         }
         
-        $translationsDecoded = json_decode($translations, true);
+                $translationsDecoded = json_decode(htmlspecialchars_decode($translations), true);
+
+        if (json_last_error() !== JSON_ERROR_NONE) {
+             $translationsDecoded = json_decode(stripslashes(htmlspecialchars_decode($translations)), true);
+        }
         if (json_last_error() !== JSON_ERROR_NONE) {
             echo json_encode(['success' => false, 'message' => 'Invalid translation data format.']);
             exit;

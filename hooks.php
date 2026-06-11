@@ -8,6 +8,7 @@
 if (!defined("WHMCS")) {
     die("This file cannot be accessed directly");
 }
+include 'multidomain.php';
 
 // file_put_contents(__DIR__ . '/hooks_loaded.log', "Loaded at " . date('Y-m-d H:i:s') . " | URI: " . ($_SERVER['REQUEST_URI'] ?? '') . "\n", FILE_APPEND);
 
@@ -34,6 +35,17 @@ try {
             $table->integer('brand_id');
             $table->timestamps();
         });
+    }
+} catch (\Exception $e) {}
+
+// Dynamically add is_branded column to mod_multibrand_invoice_brands table if missing to ensure seamless upgrades
+try {
+    if (Capsule::schema()->hasTable('mod_multibrand_invoice_brands')) {
+        if (!Capsule::schema()->hasColumn('mod_multibrand_invoice_brands', 'is_branded')) {
+            Capsule::schema()->table('mod_multibrand_invoice_brands', function ($table) {
+                $table->tinyInteger('is_branded')->default(0);
+            });
+        }
     }
 } catch (\Exception $e) {}
 
@@ -362,10 +374,67 @@ add_hook('ClientAreaInit', 1, function ($vars) {
     }
 
     $brand = get_multibrand_active_brand();
-    if ($brand && $brand->system_theme) {
-        $theme = strtolower($brand->system_theme);
-        $GLOBALS['CONFIG']['Template'] = $theme;
-        $GLOBALS['CONFIG']['systpl'] = $theme;
+    if ($brand) {
+        // Dynamic Brand-wise System URL Overrides
+        if (!empty($brand->system_url)) {
+            $GLOBALS['CONFIG']['SystemURL'] = $brand->system_url;
+            $GLOBALS['CONFIG']['SystemSSLURL'] = $brand->system_url;
+        }
+        if ($brand->system_theme) {
+            $theme = strtolower($brand->system_theme);
+            $GLOBALS['CONFIG']['Template'] = $theme;
+            $GLOBALS['CONFIG']['systpl'] = $theme;
+        }
+        if ($brand->default_language) {
+            $lang = strtolower($brand->default_language);
+            if (!isset($_SESSION['Language'])) {
+                $_SESSION['Language'] = $lang;
+            }
+            $GLOBALS['CONFIG']['Language'] = $lang;
+        }
+
+        // Restrict and set default currency based on brand settings
+        $allowedCurrencies = [];
+        if (!empty($brand->brand_currencies)) {
+            $currencyCodes = array_map('trim', explode(',', $brand->brand_currencies));
+            if (!empty($currencyCodes)) {
+                $allowedCurrencies = Capsule::table('tblcurrencies')
+                    ->whereIn('code', $currencyCodes)
+                    ->pluck('id')
+                    ->toArray();
+            }
+        }
+
+        $requestedCurrencyId = isset($_GET['currency']) ? (int)$_GET['currency'] : 0;
+        $currentCurrencyId = isset($_SESSION['currency']) ? (int)$_SESSION['currency'] : 0;
+
+        if (!isset($_SESSION['uid']) || $_SESSION['uid'] <= 0) {
+            // Visitors (not logged in)
+            $defaultCurrencyId = 0;
+            if (!empty($brand->default_currency)) {
+                $dc = Capsule::table('tblcurrencies')->where('code', $brand->default_currency)->first();
+                if ($dc) {
+                    $defaultCurrencyId = $dc->id;
+                }
+            }
+
+            if ($defaultCurrencyId > 0 && !empty($allowedCurrencies) && !in_array($defaultCurrencyId, $allowedCurrencies)) {
+                $allowedCurrencies[] = $defaultCurrencyId;
+            }
+
+            if ($currentCurrencyId === 0 || (!empty($allowedCurrencies) && !in_array($currentCurrencyId, $allowedCurrencies)) || ($requestedCurrencyId > 0 && !empty($allowedCurrencies) && !in_array($requestedCurrencyId, $allowedCurrencies))) {
+                if ($defaultCurrencyId > 0) {
+                    $_SESSION['currency'] = $defaultCurrencyId;
+                } elseif (!empty($allowedCurrencies)) {
+                    $_SESSION['currency'] = $allowedCurrencies[0];
+                }
+            }
+        } else {
+            // Logged-in clients: enforce brand currencies if configured
+            if (!empty($allowedCurrencies) && !in_array($currentCurrencyId, $allowedCurrencies)) {
+                $_SESSION['currency'] = $allowedCurrencies[0];
+            }
+        }
     }
 });
 
@@ -384,6 +453,8 @@ function get_multibrand_client_stats($clientId, $brandId)
 
     $activeServices = 0;
     $totalServices = 0;
+    $activeDomains = 0;
+    $totalDomains = 0;
     $unpaidInvoices = 0;
     $totalInvoices = 0;
     $activeTickets = 0;
@@ -402,6 +473,19 @@ function get_multibrand_client_stats($clientId, $brandId)
                 ->join('mod_multibrand_service_brands', 'tblhosting.id', '=', 'mod_multibrand_service_brands.service_id')
                 ->where('tblhosting.userid', $clientId)
                 ->where('mod_multibrand_service_brands.brand_id', $brandId)
+                ->count();
+
+            $activeDomains = (int)Capsule::table('tbldomains')
+                ->join('mod_multibrand_order_brands', 'tbldomains.orderid', '=', 'mod_multibrand_order_brands.order_id')
+                ->where('tbldomains.userid', $clientId)
+                ->where('mod_multibrand_order_brands.brand_id', $brandId)
+                ->where('tbldomains.status', 'Active')
+                ->count();
+
+            $totalDomains = (int)Capsule::table('tbldomains')
+                ->join('mod_multibrand_order_brands', 'tbldomains.orderid', '=', 'mod_multibrand_order_brands.order_id')
+                ->where('tbldomains.userid', $clientId)
+                ->where('mod_multibrand_order_brands.brand_id', $brandId)
                 ->count();
 
             $unpaidInvoices = (int)Capsule::table('tblinvoices')
@@ -435,6 +519,8 @@ function get_multibrand_client_stats($clientId, $brandId)
     $stats[$cacheKey] = [
         'active_services' => $activeServices,
         'total_services'  => $totalServices,
+        'active_domains'  => $activeDomains,
+        'total_domains'   => $totalDomains,
         'unpaid_invoices' => $unpaidInvoices,
         'total_invoices'  => $totalInvoices,
         'active_tickets'  => $activeTickets,
@@ -494,8 +580,37 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                 die('<div style="text-align:center; margin-top:50px; font-family: sans-serif;"><h1>Maintenance Mode</h1><p>' . nl2br(htmlspecialchars($message)) . '</p></div>');
             }
         }
-
+         if (!empty($brand->system_url)) {
+            $GLOBALS['CONFIG']['SystemURL'] = $systemurl;
+            $GLOBALS['CONFIG']['SystemSSLURL'] = $brand->system_url;
+            $vars['systemurl'] = $brand->system_url;
+            $vars['systemsslurl'] = $brand->system_url;
+            $vars['systemNonSSLURL'] = $brand->system_url;
+            $GLOBALS['CONFIG']['Domain'] = parse_url($brand->system_url, PHP_URL_HOST);
+        }
+          if ($brand->system_theme) {
+            
+            $theme = strtolower($brand->system_theme);
+            $GLOBALS['CONFIG']['Template'] = $theme;
+            $GLOBALS['CONFIG']['systpl'] = $theme;
+        }
+        if ($brand->default_language) {
+            // print_r($brand->default_language);die();
+            $lang = strtolower($brand->default_language);
+            if (!isset($_SESSION['Language'])) {
+                $_SESSION['Language'] = $lang;
+            }
+            $GLOBALS['CONFIG']['Language'] = $lang;
+        }
+        // print('<pre>');           
+        // print_r($GLOBALS);die();
         $overrides = [];
+
+        if (!empty($brand->system_url)) {
+            $overrides['systemurl'] = $brand->system_url;
+            $overrides['systemsslurl'] = $brand->system_url;
+            $overrides['systemNonSSLURL'] = $brand->system_url;
+        }
 
         if ($brand->company_name) {
             $overrides['companyname'] = $brand->company_name;
@@ -732,6 +847,12 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                     ->pluck('ticket_id')
                     ->toArray();
 
+                $brandDomainIds = Capsule::table('tbldomains')
+                    ->join('mod_multibrand_order_brands', 'tbldomains.orderid', '=', 'mod_multibrand_order_brands.order_id')
+                    ->where('mod_multibrand_order_brands.brand_id', $brand->id)
+                    ->pluck('tbldomains.id')
+                    ->toArray();
+
                 // Helper to filter items in list (handles arrays and objects)
                 $filterEntityList = function ($list, $allowedIds) {
                     if (!is_array($list)) {
@@ -776,7 +897,13 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                     }
                 }
 
-
+                // Filter domains lists
+                $domainKeys = ['domains', 'activeDomains', 'activedomains'];
+                foreach ($domainKeys as $key) {
+                    if (isset($vars[$key]) && is_array($vars[$key])) {
+                        $overrides[$key] = $filterEntityList($vars[$key], $brandDomainIds);
+                    }
+                }
 
                 // Fetch statistics for matching brand
                 $stats = get_multibrand_client_stats($clientId, $brand->id);
@@ -790,6 +917,9 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                     $cStats['hostingnum'] = $stats['total_services'];
                     $cStats['servicesnumactive'] = $stats['active_services'];
                     $cStats['servicesnum'] = $stats['total_services'];
+
+                    $cStats['numactivedomains'] = $stats['active_domains'];
+                    $cStats['numdomains'] = $stats['total_domains'];
 
                     $cStats['numunpaidinvoices'] = $stats['unpaid_invoices'];
                     $cStats['numdueinvoices'] = $stats['unpaid_invoices'];
@@ -808,6 +938,9 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                 if ($filename == 'clientarea' && $action == 'services') {
                     $overrides['totalresults'] = $stats['total_services'];
                     $overrides['numservices'] = $stats['total_services'];
+                } elseif ($filename == 'clientarea' && $action == 'domains') {
+                    $overrides['totalresults'] = $stats['total_domains'];
+                    $overrides['numdomains'] = $stats['total_domains'];
                 } elseif ($filename == 'clientarea' && $action == 'invoices') {
                     $overrides['totalresults'] = $stats['total_invoices'];
                     $overrides['numinvoices'] = $stats['total_invoices'];
@@ -1049,6 +1182,132 @@ add_hook('ClientAreaSecondarySidebar', 1, function ($secondarySidebar) {
                 $panel->setBadge($stats['unpaid_invoices']);
             } elseif (strpos($panelName, 'ticket') !== false || strpos($panelName, 'support') !== false) {
                 $panel->setBadge($stats['active_tickets']);
+            }
+        }
+    }
+});
+
+/**
+ * Client Area Homepage Panels Hook
+ * Filters the active dashboard panels to show only brand-specific items
+ */
+add_hook('ClientAreaHomepagePanels', 1, function ($homePagePanels) {
+    $brand = get_multibrand_active_brand();
+    $clientId = (int)($_SESSION['uid'] ?? 0);
+
+    if ($brand && $clientId > 0) {
+        $stats = get_multibrand_client_stats($clientId, $brand->id);
+
+        // 1. Filter "Active Products/Services" panel
+        $productsPanel = $homePagePanels->getChild('Active Products/Services');
+        if ($productsPanel) {
+            $brandServiceIds = Capsule::table('mod_multibrand_service_brands')
+                ->where('brand_id', $brand->id)
+                ->pluck('service_id')
+                ->toArray();
+
+            foreach ($productsPanel->getChildren() as $child) {
+                $uri = $child->getUri();
+                preg_match('/id=(\d+)/', $uri, $matches);
+                $serviceId = isset($matches[1]) ? (int)$matches[1] : 0;
+                if ($serviceId > 0 && !in_array($serviceId, $brandServiceIds)) {
+                    $productsPanel->removeChild($child->getName());
+                }
+            }
+        }
+
+        // 2. Filter "Overdue Invoices" panel
+        $invoicesPanel = $homePagePanels->getChild('Overdue Invoices');
+        if ($invoicesPanel) {
+            $brandInvoiceIds = Capsule::table('mod_multibrand_invoice_brands')
+                ->where('brand_id', $brand->id)
+                ->pluck('invoice_id')
+                ->toArray();
+
+            foreach ($invoicesPanel->getChildren() as $child) {
+                $uri = $child->getUri();
+                preg_match('/id=(\d+)/', $uri, $matches);
+                $invoiceId = isset($matches[1]) ? (int)$matches[1] : 0;
+                if ($invoiceId > 0 && !in_array($invoiceId, $brandInvoiceIds)) {
+                    $invoicesPanel->removeChild($child->getName());
+                }
+            }
+
+            // Recalculate and swap body HTML counts and balance
+            $clientTotalUnpaidCount = Capsule::table('tblinvoices')
+                ->where('userid', $clientId)
+                ->where('status', 'Unpaid')
+                ->count();
+
+            $clientTotalUnpaidInvoices = Capsule::table('tblinvoices')
+                ->where('userid', $clientId)
+                ->where('status', 'Unpaid')
+                ->select('total', 'credit')
+                ->get();
+            $clientTotalBalance = 0.00;
+            foreach ($clientTotalUnpaidInvoices as $inv) {
+                $clientTotalBalance += (float)$inv->total - (float)($inv->credit ?? 0.00);
+            }
+
+            $client = Capsule::table('tblclients')->where('id', $clientId)->first();
+            $currencyId = $client ? (int)$client->currency : 1;
+
+            if (function_exists('formatCurrency')) {
+                $clientTotalBalanceFormatted = formatCurrency($clientTotalBalance, $currencyId);
+            } else {
+                $clientTotalBalanceFormatted = '$' . number_format($clientTotalBalance, 2);
+            }
+
+            $brandUnpaidInvoices = Capsule::table('tblinvoices')
+                ->join('mod_multibrand_invoice_brands', 'tblinvoices.id', '=', 'mod_multibrand_invoice_brands.invoice_id')
+                ->where('tblinvoices.userid', $clientId)
+                ->where('mod_multibrand_invoice_brands.brand_id', $brand->id)
+                ->where('tblinvoices.status', 'Unpaid')
+                ->select('tblinvoices.total', 'tblinvoices.credit')
+                ->get();
+
+            $brandTotalBalance = 0.00;
+            foreach ($brandUnpaidInvoices as $inv) {
+                $brandTotalBalance += (float)$inv->total - (float)($inv->credit ?? 0.00);
+            }
+
+            if (function_exists('formatCurrency')) {
+                $brandBalanceFormatted = formatCurrency($brandTotalBalance, $currencyId);
+            } else {
+                $brandBalanceFormatted = '$' . number_format($brandTotalBalance, 2);
+            }
+
+            $bodyHtml = $invoicesPanel->getBodyHtml();
+            if ($bodyHtml) {
+                $bodyHtml = str_replace((string)$clientTotalUnpaidCount, (string)$stats['unpaid_invoices'], $bodyHtml);
+                $bodyHtml = str_replace($clientTotalBalanceFormatted, $brandBalanceFormatted, $bodyHtml);
+                $invoicesPanel->setBodyHtml($bodyHtml);
+            }
+        }
+
+        // 3. Filter "Recent Support Tickets" panel
+        $ticketsPanel = $homePagePanels->getChild('Recent Support Tickets');
+        if ($ticketsPanel) {
+            $brandTicketIds = Capsule::table('mod_multibrand_ticket_brands')
+                ->where('brand_id', $brand->id)
+                ->pluck('ticket_id')
+                ->toArray();
+
+            foreach ($ticketsPanel->getChildren() as $child) {
+                $uri = $child->getUri();
+                $ticketId = 0;
+                if (preg_match('/id=(\d+)/', $uri, $matches)) {
+                    $ticketId = (int)$matches[1];
+                } elseif (preg_match('/tid=([^&]+)/', $uri, $matches)) {
+                    $tid = $matches[1];
+                    try {
+                        $ticketId = (int)Capsule::table('tbltickets')->where('tid', $tid)->value('id');
+                    } catch (\Exception $e) {}
+                }
+
+                if ($ticketId > 0 && !in_array($ticketId, $brandTicketIds)) {
+                    $ticketsPanel->removeChild($child->getName());
+                }
             }
         }
     }
@@ -1376,10 +1635,12 @@ add_hook('ClientLogout', 1, function ($vars) {
  */
 add_hook('ClientAreaFooterOutput', 1, function ($vars) {
     $brand = get_multibrand_active_brand();
+    // print_r($filename);
+    // print_r($brand);die();
     if ($brand && $brand->ticket_departments) {
         $brandDepts = array_values(array_filter(array_map('intval', explode(',', $brand->ticket_departments))));
-        
         $filename = $vars['filename'] ?? '';
+        
         
         if (in_array($filename, ['supporttickets', 'submitticket']) && !empty($brandDepts)) {
             $jsonDepts = json_encode($brandDepts);
@@ -1395,7 +1656,19 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
                         if (match) {
                             var deptId = parseInt(match[1], 10);
                             if ($.inArray(deptId, brandDepts) === -1) {
-                                $(this).closest('.panel, .list-group-item, .dept-box, .btn, tr').hide();
+                                var parentElement = $(this).closest('.panel, .list-group-item, .dept-box, .btn, tr, .col-md-6, .col-sm-6, .margin-bottom');
+                                if (parentElement.length) {
+                                    parentElement.hide();
+                                } else {
+                                    // Fallback for paragraph list styles (e.g. Twenty-One)
+                                    var pParent = $(this).closest('p');
+                                    if (pParent.length) {
+                                        if (pParent.next('p.text-muted').length) {
+                                            pParent.next('p.text-muted').hide();
+                                        }
+                                        pParent.hide();
+                                    }
+                                }
                             }
                         }
                     });
@@ -1423,15 +1696,14 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
 if (!class_exists('MultiBrandEmailOverrideManager')) {
     class MultiBrandEmailOverrideManager
     {
+        
         private static $backup = null;
         private static $isShutdownRegistered = false;
-
         public static function apply($brand)
         {
             if (self::$backup !== null) {
                 return;
             }
-
             $configKeys = [
                 'MailType',
                 'SMTPHost',
@@ -1495,10 +1767,13 @@ if (!class_exists('MultiBrandEmailOverrideManager')) {
             if (!empty($brand->company_name)) {
                 $overrides['SystemEmailsFromName'] = $brand->company_name;
             }
-
+            // print_r($overrides);die();
             // 3. Apply overrides
             foreach ($overrides as $key => $val) {
                 \WHMCS\Database\Capsule::table('tblconfiguration')->updateOrInsert(['setting' => $key], ['value' => $val]);
+                if (method_exists('WHMCS\\Config\\Setting', 'updateRuntimeConfigCache')) {
+                    \WHMCS\Config\Setting::updateRuntimeConfigCache($key, $val);
+                }
             }
 
             // 4. Shutdown fallback restorer
@@ -1520,6 +1795,9 @@ if (!class_exists('MultiBrandEmailOverrideManager')) {
                     \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', $key)->delete();
                 } else {
                     \WHMCS\Database\Capsule::table('tblconfiguration')->updateOrInsert(['setting' => $key], ['value' => $val]);
+                }
+                if (method_exists('WHMCS\\Config\\Setting', 'updateRuntimeConfigCache')) {
+                    \WHMCS\Config\Setting::updateRuntimeConfigCache($key, $val === null ? '' : $val);
                 }
             }
 
@@ -1654,19 +1932,354 @@ add_hook('EmailPreSend', 1, function ($vars) {
         $merge_fields['time'] = date('H:i:s');
 
         // Look up custom template overrides
-        $overrides = [];
+        $brandedTemplate = null;
         try {
             $brandedTemplate = \WHMCS\Database\Capsule::table('mod_multibrand_email_templates')
                 ->where('brand_id', $brand->id)
                 ->where('template_name', $messagename)
                 ->where('status', 1)
                 ->first();
-                
+        } catch (\Exception $e) {}
+
+        $smtp = json_decode(htmlspecialchars_decode($brand->smtp_settings ?: '{}'), true);
+        $hasSmtpOverride = !empty($smtp['override']);
+
+        if ($brandedTemplate || $hasSmtpOverride) {
+            $get_protected_property = function ($obj, $propName) {
+                try {
+                    $ref = new \ReflectionClass($obj);
+                    if ($ref->hasProperty($propName)) {
+                        $prop = $ref->getProperty($propName);
+                        $prop->setAccessible(true);
+                        return $prop->getValue($obj);
+                    }
+                } catch (\Exception $e) {}
+                return null;
+            };
+
+            $render_email_template = function ($templateString, $mergeFields) {
+                try {
+                    $smarty = new \Smarty();
+                    if (defined('ROOTDIR')) {
+                        $smarty->setCompileDir(ROOTDIR . '/templates_c');
+                        $smarty->setCacheDir(ROOTDIR . '/templates_c');
+                    } else {
+                        $smarty->setCompileDir(__DIR__ . '/../../../templates_c');
+                        $smarty->setCacheDir(__DIR__ . '/../../../templates_c');
+                    }
+                    $smarty->assign($mergeFields);
+                    return $smarty->fetch('string:' . $templateString);
+                } catch (\Exception $e) {
+                    return $templateString;
+                }
+            };
+
+            // Find WHMCS Mailer/Emailer object in backtrace
+            $trace = debug_backtrace(DEBUG_BACKTRACE_PROVIDE_OBJECT);
+            $mailEntity = null;
+            foreach ($trace as $step) {
+                if (isset($step['object']) && (stripos(get_class($step['object']), 'Mail') !== false || is_a($step['object'], '\\WHMCS\\Mail\\Emailer') || is_subclass_of($step['object'], '\\WHMCS\\Mail\\Emailer'))) {
+                    $mailEntity = $step['object'];
+                    break;
+                }
+            }
+
+            if ($mailEntity) {
+                $messageObj = $get_protected_property($mailEntity, 'message');
+                if ($messageObj) {
+                    // Extract fields
+                    $to = $get_protected_property($messageObj, 'to') ?: [];
+                    $cc = $get_protected_property($messageObj, 'cc') ?: [];
+                    $bcc = $get_protected_property($messageObj, 'bcc') ?: [];
+                    $replyTo = $get_protected_property($messageObj, 'replyTo') ?: [];
+                    $attachments = $get_protected_property($messageObj, 'attachments') ?: [];
+                    $headers = $get_protected_property($messageObj, 'headers') ?: [];
+
+                    $defaultSubject = $get_protected_property($messageObj, 'subject') ?: '';
+                    $defaultBody = $get_protected_property($messageObj, 'body') ?: '';
+
+                    // Determine language
+                    $clientLang = '';
+                    $clientId = (int)$get_protected_property($mailEntity, 'recipientClientId');
+                    if ($clientId > 0) {
+                        try {
+                            $client = \WHMCS\Database\Capsule::table('tblclients')->where('id', $clientId)->first();
+                            if ($client) {
+                                $clientLang = strtolower($client->language);
+                            }
+                        } catch (\Exception $e) {}
+                    }
+                    if (empty($clientLang) && !empty($brand->default_language)) {
+                        $clientLang = strtolower($brand->default_language);
+                    }
+
+                    $subject = '';
+                    $body = '';
+                    if ($brandedTemplate) {
+                        $translations = json_decode(htmlspecialchars_decode($brandedTemplate->translations ?: '{}'), true) ?: [];
+                        if (!empty($clientLang) && isset($translations[$clientLang])) {
+                            $subject = $translations[$clientLang]['subject'];
+                            $body = $translations[$clientLang]['message'];
+                        }
+                        if (empty($subject) && isset($translations['default'])) {
+                            $subject = $translations['default']['subject'];
+                            $body = $translations['default']['message'];
+                        }
+                    }
+
+                    if (empty($subject)) {
+                        $subject = $defaultSubject;
+                    }
+                    if (empty($body)) {
+                        $body = $defaultBody;
+                    }
+
+                    // Render styling elements
+                    $email_templates = json_decode(htmlspecialchars_decode($brand->email_template_settings ?: '{}'), true);
+                    $css = !empty($email_templates['css']) ? $email_templates['css'] : '';
+                    $header = !empty($email_templates['header']) ? $email_templates['header'] : '';
+                    $footer = !empty($email_templates['footer']) ? $email_templates['footer'] : '';
+
+                    if (empty($css)) {
+                        try {
+                            $cssRow = \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'EmailCSS')->first();
+                            $css = $cssRow ? $cssRow->value : '';
+                        } catch (\Exception $e) {}
+                    }
+                    if (empty($header)) {
+                        try {
+                            $headerRow = \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'EmailGlobalHeader')->first();
+                            $header = $headerRow ? $headerRow->value : '';
+                        } catch (\Exception $e) {}
+                    }
+                    if (empty($footer)) {
+                        try {
+                            $footerRow = \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'EmailGlobalFooter')->first();
+                            $footer = $footerRow ? $footerRow->value : '';
+                        } catch (\Exception $e) {}
+                    }
+
+                    // Compile template
+                    $allMergeFields = array_merge($vars['mergefields'] ?: [], $merge_fields);
+                    $allMergeFields['email_css'] = $css;
+
+                    $compiledSubject = $render_email_template($subject, $allMergeFields);
+                    $compiledBody = $render_email_template($body, $allMergeFields);
+                    $compiledHeader = $render_email_template($header, $allMergeFields);
+                    $compiledFooter = $render_email_template($footer, $allMergeFields);
+
+                    $finalHtmlBody = $compiledHeader . "\n" . $compiledBody . "\n" . $compiledFooter;
+                    $compiledPlainBody = strip_tags($compiledBody);
+
+                    // Determine SMTP settings
+                    if ($hasSmtpOverride) {
+                        $smtp_host = !empty($smtp['hostname']) ? $smtp['hostname'] : '';
+                        $smtp_port = !empty($smtp['port']) ? $smtp['port'] : '587';
+                        $smtp_user = !empty($smtp['username']) ? $smtp['username'] : '';
+                        $smtp_pass = isset($smtp['password']) ? $smtp['password'] : '';
+                        $smtp_secure = !empty($smtp['ssl_type']) ? strtolower($smtp['ssl_type']) : '';
+                        $smtp_mail_type = !empty($smtp['mail_type']) ? $smtp['mail_type'] : 'SMTP';
+                    } else {
+                        // Load system config
+                        try {
+                            $mailConfigRow = \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'MailConfig')->first();
+                            if ($mailConfigRow && $mailConfigRow->value) {
+                                $mailConfig = json_decode(decrypt($mailConfigRow->value), true);
+                                $smtp_host = isset($mailConfig['configuration']['host']) ? $mailConfig['configuration']['host'] : '';
+                                $smtp_port = isset($mailConfig['configuration']['port']) ? $mailConfig['configuration']['port'] : '';
+                                $smtp_user = isset($mailConfig['configuration']['username']) ? $mailConfig['configuration']['username'] : '';
+                                $smtp_pass = isset($mailConfig['configuration']['password']) ? $mailConfig['configuration']['password'] : '';
+                                $smtp_secure = isset($mailConfig['configuration']['secure']) ? strtolower($mailConfig['configuration']['secure']) : '';
+                                $smtp_mail_type = (isset($mailConfig['module']) && $mailConfig['module'] === 'SmtpMail') ? 'SMTP' : 'mail';
+                            } else {
+                                $smtp_host = \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'SMTPHost')->value('value') ?: '';
+                                $smtp_port = \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'SMTPPort')->value('value') ?: '';
+                                $smtp_user = \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'SMTPUsername')->value('value') ?: '';
+                                $smtp_pass = decrypt(\WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'SMTPPassword')->value('value') ?: '');
+                                $smtp_secure = strtolower(\WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'SMTPSSL')->value('value') ?: '');
+                                $smtp_mail_type = \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'MailType')->value('value') ?: 'mail';
+                            }
+                        } catch (\Exception $e) {
+                            $smtp_host = ''; $smtp_port = '587'; $smtp_user = ''; $smtp_pass = ''; $smtp_secure = ''; $smtp_mail_type = 'mail';
+                        }
+                    }
+
+                    // Send using PHPMailer
+                    try {
+                        $mail = new \PHPMailer\PHPMailer\PHPMailer(true);
+                        $mail->CharSet = 'UTF-8';
+
+                        if (strtolower($smtp_mail_type) === 'smtp') {
+                            $mail->isSMTP();
+                            $mail->Host = $smtp_host;
+                            $mail->Port = $smtp_port;
+                            $mail->SMTPAuth = !empty($smtp_user);
+                            $mail->Username = $smtp_user;
+                            $mail->Password = $smtp_pass;
+                            if ($smtp_secure === 'ssl' || $smtp_secure === 'tls') {
+                                $mail->SMTPSecure = $smtp_secure;
+                            } else {
+                                $mail->SMTPSecure = '';
+                                $mail->SMTPAutoTLS = false;
+                            }
+                        } else {
+                            $mail->isMail();
+                        }
+
+                        $fromEmail = !empty($brand->email_address) ? $brand->email_address : '';
+                        $fromName = !empty($brand->company_name) ? $brand->company_name : $brand->brand_name;
+
+                        if (empty($fromEmail)) {
+                            try {
+                                $fromEmailRow = \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'SystemEmailsFromEmail')->first();
+                                $fromEmail = $fromEmailRow ? $fromEmailRow->value : 'noreply@yourdomain.com';
+                            } catch (\Exception $e) {}
+                        }
+                        if (empty($fromName)) {
+                            try {
+                                $fromNameRow = \WHMCS\Database\Capsule::table('tblconfiguration')->where('setting', 'SystemEmailsFromName')->first();
+                                $fromName = $fromNameRow ? $fromNameRow->value : 'System';
+                            } catch (\Exception $e) {}
+                        }
+
+                        $mail->setFrom($fromEmail, $fromName);
+
+                        if (!empty($replyTo)) {
+                            foreach ($replyTo as $rEmail => $rDetails) {
+                                if (!empty($rEmail)) {
+                                    $mail->addReplyTo($rEmail, isset($rDetails[1]) ? $rDetails[1] : '');
+                                }
+                            }
+                        } else {
+                            $mail->addReplyTo($fromEmail, $fromName);
+                        }
+
+                        if (!empty($to)) {
+                            foreach ($to as $tEmail => $tDetails) {
+                                if (!empty($tEmail)) {
+                                    $mail->addAddress($tEmail, isset($tDetails[1]) ? $tDetails[1] : '');
+                                }
+                            }
+                        }
+
+                        if (!empty($cc)) {
+                            foreach ($cc as $cEmail => $cDetails) {
+                                if (!empty($cEmail)) {
+                                    $mail->addCC($cEmail, isset($cDetails[1]) ? $cDetails[1] : '');
+                                }
+                            }
+                        }
+                        if ($brandedTemplate && !empty($brandedTemplate->copy_to)) {
+                            $ccEmails = array_map('trim', explode(',', $brandedTemplate->copy_to));
+                            foreach ($ccEmails as $cEmail) {
+                                if (!empty($cEmail)) {
+                                    $mail->addCC($cEmail);
+                                }
+                            }
+                        }
+
+                        if (!empty($bcc)) {
+                            foreach ($bcc as $bEmail => $bDetails) {
+                                if (!empty($bEmail)) {
+                                    $mail->addBCC($bEmail, isset($bDetails[1]) ? $bDetails[1] : '');
+                                }
+                            }
+                        }
+                        if ($brandedTemplate && !empty($brandedTemplate->blind_copy_to)) {
+                            $bccEmails = array_map('trim', explode(',', $brandedTemplate->blind_copy_to));
+                            foreach ($bccEmails as $bEmail) {
+                                if (!empty($bEmail)) {
+                                    $mail->addBCC($bEmail);
+                                }
+                            }
+                        }
+
+                        if (!empty($attachments)) {
+                            foreach ($attachments as $attachment) {
+                                if (is_array($attachment)) {
+                                    $path = isset($attachment['path']) ? $attachment['path'] : (isset($attachment[0]) ? $attachment[0] : '');
+                                    $name = isset($attachment['filename']) ? $attachment['filename'] : (isset($attachment[1]) ? $attachment[1] : '');
+                                    if (file_exists($path)) {
+                                        $mail->addAttachment($path, $name);
+                                    }
+                                } elseif (is_string($attachment) && file_exists($attachment)) {
+                                    $mail->addAttachment($attachment);
+                                }
+                            }
+                        }
+
+                        $mail->Subject = $compiledSubject;
+                        $mail->isHTML(true);
+                        $mail->Body = $finalHtmlBody;
+                        $mail->AltBody = $compiledPlainBody;
+
+                        $mail->send();
+
+                        // Log email success in tblemails
+                        try {
+                            $ccStr = '';
+                            if (!empty($cc)) {
+                                $ccStr = implode(',', array_keys($cc));
+                            }
+                            $bccStr = '';
+                            if (!empty($bcc)) {
+                                $bccStr = implode(',', array_keys($bcc));
+                            }
+                            $toStr = '';
+                            if (!empty($to)) {
+                                $toStr = implode(',', array_keys($to));
+                            }
+
+                            \WHMCS\Database\Capsule::table('tblemails')->insert([
+                                'userid' => $clientId,
+                                'subject' => $compiledSubject,
+                                'message' => $finalHtmlBody,
+                                'date' => date('Y-m-d H:i:s'),
+                                'to' => $toStr,
+                                'cc' => $ccStr,
+                                'bcc' => $bccStr,
+                            ]);
+                        } catch (\Exception $dbEx) {}
+
+                        $clientName = '';
+                        if (isset($allMergeFields['client_name'])) {
+                            $clientName = $allMergeFields['client_name'];
+                        } elseif ($clientId > 0) {
+                            try {
+                                $client = \WHMCS\Database\Capsule::table('tblclients')->where('id', $clientId)->first();
+                                if ($client) {
+                                    $clientName = $client->firstname . ' ' . $client->lastname;
+                                }
+                            } catch (\Exception $e) {}
+                        }
+
+                        if (function_exists('logActivity')) {
+                            logActivity("Email Sent to " . $clientName . " (" . $compiledSubject . ") - Client ID: " . $clientId);
+                        }
+
+                        // Restore settings
+                        MultiBrandEmailOverrideManager::restore();
+
+                        // Abort WHMCS default sending
+                        return ['abortsend' => true];
+
+                    } catch (\Exception $mailEx) {
+                        if (function_exists('logActivity')) {
+                            logActivity("Email Sending Failed - SMTP Error: " . $mailEx->getMessage() . " (Subject: " . $compiledSubject . ")");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Rest of the normal template lookup for merge fields (if not intercepted)
+        $overrides = [];
+        try {
             if ($brandedTemplate) {
                 // Resolve client's language
                 $clientLang = '';
                 $clientId = 0;
-                
+
                 if (isset($vars['mergefields']['client_id'])) {
                     $clientId = (int)$vars['mergefields']['client_id'];
                 } elseif (isset($vars['mergefields']['userid'])) {
@@ -1674,33 +2287,33 @@ add_hook('EmailPreSend', 1, function ($vars) {
                 } elseif (isset($vars['mergefields']['clientid'])) {
                     $clientId = (int)$vars['mergefields']['clientid'];
                 }
-                
+
                 if ($clientId > 0) {
                     $client = \WHMCS\Database\Capsule::table('tblclients')->where('id', $clientId)->first();
                     if ($client) {
                         $clientLang = strtolower($client->language);
                     }
                 }
-                
+
                 if (empty($clientLang) && !empty($brand->default_language)) {
                     $clientLang = strtolower($brand->default_language);
                 }
-                
+
                 $translations = json_decode(htmlspecialchars_decode($brandedTemplate->translations ?: '{}'), true) ?: [];
-                
+
                 $subject = '';
                 $message = '';
-                
+
                 if (!empty($clientLang) && isset($translations[$clientLang])) {
                     $subject = $translations[$clientLang]['subject'];
                     $message = $translations[$clientLang]['message'];
                 }
-                
+
                 if (empty($subject) && isset($translations['default'])) {
                     $subject = $translations['default']['subject'];
                     $message = $translations['default']['message'];
                 }
-                
+
                 if (!empty($subject)) {
                     $overrides['subject'] = $subject;
                 }
@@ -1832,11 +2445,10 @@ add_hook('ClientAdd', 1, function ($vars) {
  * Client Login Hook
  * Updates/Saves client brand on login based on domain
  */
-add_hook('ClientLogin', 1, function ($vars) {
-    $userid = isset($vars['userid']) ? $vars['userid'] : (isset($vars['user_id']) ? $vars['user_id'] : 0);
+add_hook('UserLogin', 1, function ($vars) {
+    $userid = isset($vars['user']['id']) ? $vars['user']['id'] : (isset($vars['user']['id']) ? $vars['user']['id'] : 0);
     $brand = get_multibrand_brand_by_domain();
-
-    if ($brand && $userid) {
+    if ($brand && $userid && $brand->auto_client_assignment) {
         try {
             $exists = Capsule::table('mod_multibrand_client_brands')
                 ->where('client_id', $userid)
@@ -3740,8 +4352,9 @@ add_hook('InvoiceCreated', 1, function ($vars) {
         if ($brandId > 0) {
             $exists = Capsule::table('mod_multibrand_invoice_brands')
                 ->where('invoice_id', $invoiceId)
-                ->exists();
+                ->first();
                 
+            $isBranded = false;
             if ($exists) {
                 Capsule::table('mod_multibrand_invoice_brands')
                     ->where('invoice_id', $invoiceId)
@@ -3749,18 +4362,144 @@ add_hook('InvoiceCreated', 1, function ($vars) {
                         'brand_id' => $brandId,
                         'updated_at' => date('Y-m-d H:i:s')
                     ]);
+                $isBranded = (bool)$exists->is_branded;
             } else {
                 Capsule::table('mod_multibrand_invoice_brands')->insert([
                     'invoice_id' => $invoiceId,
                     'brand_id' => $brandId,
+                    'is_branded' => 0,
                     'created_at' => date('Y-m-d H:i:s'),
                     'updated_at' => date('Y-m-d H:i:s')
                 ]);
             }
+
+            // Assign sequential invoice number branding on creation if proforma is disabled
+            try {
+                $brand = Capsule::table('mod_multibrand_brands')->find($brandId);
+                if ($brand && $brand->invoice_number_branding && !$brand->proforma_invoice) {
+                    $invoice = Capsule::table('tblinvoices')->find($invoiceId);
+                    if ($invoice && !$isBranded) {
+                        $total = (float)$invoice->total;
+                        if ($total > 0 || $brand->zero_invoices_number_branding) {
+                            Capsule::transaction(function() use ($brandId, $invoiceId, $invoice) {
+                                $brandRow = Capsule::table('mod_multibrand_brands')
+                                    ->where('id', $brandId)
+                                    ->lockForUpdate()
+                                    ->first();
+                                
+                                $invBrandRow = Capsule::table('mod_multibrand_invoice_brands')
+                                    ->where('invoice_id', $invoiceId)
+                                    ->lockForUpdate()
+                                    ->first();
+
+                                if ($brandRow && $invBrandRow && !$invBrandRow->is_branded && $brandRow->invoice_number_branding && !$brandRow->proforma_invoice) {
+                                    $nextNum = $brandRow->next_sequential_number ?: 1;
+                                    $format = $brandRow->sequential_invoice_number_format ?: '{NUMBER}';
+                                    
+                                    $timestamp = strtotime($invoice->date ?: date('Y-m-d'));
+                                    $year = date('Y', $timestamp);
+                                    $month = date('m', $timestamp);
+                                    $day = date('d', $timestamp);
+                                    
+                                    $invoiceNum = str_replace(
+                                        ['{YEAR}', '{MONTH}', '{DAY}', '{NUMBER}'],
+                                        [$year, $month, $day, $nextNum],
+                                        $format
+                                    );
+                                    
+                                    Capsule::table('tblinvoices')
+                                        ->where('id', $invoiceId)
+                                        ->update(['invoicenum' => $invoiceNum]);
+                                        
+                                    Capsule::table('mod_multibrand_brands')
+                                        ->where('id', $brandId)
+                                        ->update([
+                                            'next_sequential_number' => $nextNum + 1,
+                                            'updated_at' => date('Y-m-d H:i:s')
+                                        ]);
+
+                                    Capsule::table('mod_multibrand_invoice_brands')
+                                        ->where('invoice_id', $invoiceId)
+                                        ->update([
+                                            'is_branded' => 1,
+                                            'updated_at' => date('Y-m-d H:i:s')
+                                        ]);
+                                }
+                            });
+                        }
+                    }
+                }
+            } catch (\Exception $ex) {}
         }
     } catch (\Exception $e) {
         // Ignore gracefully
     }
+});
+
+add_hook('InvoicePaid', 1, function ($vars) {
+    $invoiceId = (int)$vars['invoiceid'];
+    try {
+        $invBrand = Capsule::table('mod_multibrand_invoice_brands')->where('invoice_id', $invoiceId)->first();
+        if ($invBrand && $invBrand->brand_id > 0) {
+            $brandId = $invBrand->brand_id;
+            $isBranded = (bool)$invBrand->is_branded;
+
+            $brand = Capsule::table('mod_multibrand_brands')->find($brandId);
+            if ($brand && $brand->invoice_number_branding && $brand->proforma_invoice) {
+                $invoice = Capsule::table('tblinvoices')->find($invoiceId);
+                if ($invoice && !$isBranded) {
+                    $total = (float)$invoice->total;
+                    if ($total > 0 || $brand->zero_invoices_number_branding) {
+                        Capsule::transaction(function() use ($brandId, $invoiceId, $invoice) {
+                            $brandRow = Capsule::table('mod_multibrand_brands')
+                                ->where('id', $brandId)
+                                ->lockForUpdate()
+                                ->first();
+
+                            $invBrandRow = Capsule::table('mod_multibrand_invoice_brands')
+                                ->where('invoice_id', $invoiceId)
+                                ->lockForUpdate()
+                                ->first();
+
+                            if ($brandRow && $invBrandRow && !$invBrandRow->is_branded && $brandRow->invoice_number_branding && $brandRow->proforma_invoice) {
+                                $nextNum = $brandRow->next_sequential_number ?: 1;
+                                $format = $brandRow->sequential_invoice_number_format ?: '{NUMBER}';
+                                
+                                $timestamp = strtotime($invoice->date ?: date('Y-m-d'));
+                                $year = date('Y', $timestamp);
+                                $month = date('m', $timestamp);
+                                $day = date('d', $timestamp);
+                                
+                                $invoiceNum = str_replace(
+                                    ['{YEAR}', '{MONTH}', '{DAY}', '{NUMBER}'],
+                                    [$year, $month, $day, $nextNum],
+                                    $format
+                                );
+                                
+                                Capsule::table('tblinvoices')
+                                    ->where('id', $invoiceId)
+                                    ->update(['invoicenum' => $invoiceNum]);
+                                    
+                                Capsule::table('mod_multibrand_brands')
+                                    ->where('id', $brandId)
+                                    ->update([
+                                        'next_sequential_number' => $nextNum + 1,
+                                        'updated_at' => date('Y-m-d H:i:s')
+                                    ]);
+
+                                Capsule::table('mod_multibrand_invoice_brands')
+                                    ->where('invoice_id', $invoiceId)
+                                    ->update([
+                                        'is_branded' => 1,
+                                        'updated_at' => date('Y-m-d H:i:s')
+                                    ]);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    } catch (\Exception $e) {}
 });
 
 /**
@@ -4215,6 +4954,63 @@ function apply_brand_gateway_overrides($brand)
         return;
     }
 
+    // Acquire MySQL session lock to prevent concurrent database override race conditions
+    $lockAcquired = false;
+    try {
+        $lockResult = Capsule::select("SELECT GET_LOCK('multibrand_gateway_override', 15) as locked");
+        if (!empty($lockResult) && isset($lockResult[0]->locked) && $lockResult[0]->locked == 1) {
+            $lockAcquired = true;
+        }
+    } catch (\Exception $e) {
+        $lockAcquired = false;
+    }
+
+    if (!$lockAcquired) {
+        // Log or abort to prevent processing transaction under concurrent/wrong keys
+        return;
+    }
+
+    // Mapping of expected setting keys for common payment gateways
+    $gatewayExpectedKeys = [
+        'stripe' => [
+            'publishableKey' => 'client_id',
+            'secretKey'      => 'secret',
+        ],
+        'paypal' => [
+            'email'   => 'client_id',
+            'sandbox' => 'test_mode',
+        ],
+        'paypalcheckout' => [
+            'clientId'            => 'client_id',
+            'clientSecret'        => 'secret',
+            'sandboxClientId'     => 'client_id',
+            'sandboxClientSecret' => 'secret',
+            'sandbox'             => 'test_mode',
+        ],
+        'paypal_ppcpv' => [
+            'clientId'            => 'client_id',
+            'clientSecret'        => 'secret',
+            'sandboxClientId'     => 'client_id',
+            'sandboxClientSecret' => 'secret',
+            'useSandbox'          => 'test_mode',
+        ],
+        'googlepay' => [
+            'googleMerchantId' => 'client_id',
+            'publicKey'        => 'client_id',
+            'privateKey'       => 'secret',
+        ],
+        'nmi' => [
+            'securityKey' => 'secret',
+        ],
+        'adyen' => [
+            'apiKey'    => 'secret',
+            'clientKey' => 'client_id',
+        ],
+        'asiapay' => [
+            'merchantid' => 'client_id',
+        ]
+    ];
+
     $originals = [];
 
     foreach ($brandGateways as $bgw) {
@@ -4229,59 +5025,117 @@ function apply_brand_gateway_overrides($brand)
         }
 
         try {
-            $settings = Capsule::table('tblpaymentgateways')->where('gateway', $gatewayName)->get();
-            if ($settings->count() > 0) {
-                $originals[$gatewayName] = [];
-                foreach ($settings as $setting) {
-                    $originals[$gatewayName][$setting->setting] = $setting->value;
-                    
-                    $newValue = null;
-                    $sName = strtolower($setting->setting);
-                    
-                    if (in_array($sName, ['clientid', 'client_id', 'client-id'])) {
-                        $newValue = $bgw['client_id'] ?? null;
-                    } elseif (in_array($sName, ['clientsecret', 'client_secret', 'secret', 'secretkey', 'secret_key'])) {
-                        $newValue = $bgw['secret'] ?? null;
-                    } elseif (in_array($sName, ['testmode', 'test_mode', 'sandbox'])) {
-                        if ($setting->value === 'on' || $setting->value === '1' || is_numeric($setting->value)) {
-                            $newValue = !empty($bgw['test_mode']) ? $setting->value : '';
-                        } else {
-                            $newValue = !empty($bgw['test_mode']) ? 'on' : '';
-                        }
-                    } elseif (in_array($sName, ['name', 'friendlyname', 'friendly_name'])) {
-                        $newValue = $bgw['friendly_name'] ?? null;
-                    } elseif (in_array($sName, ['convertto', 'convert_to'])) {
-                        $currencyCode = $bgw['convert_to'] ?? '';
-                        if ($currencyCode) {
-                            $curr = Capsule::table('tblcurrencies')->where('code', $currencyCode)->first();
-                            if ($curr) {
-                                $newValue = $curr->id;
-                            }
-                        }
-                    }
+            // Verify if the gateway is activated in WHMCS (at least one setting row exists)
+            $existingSettings = Capsule::table('tblpaymentgateways')
+                ->where('gateway', $gatewayName)
+                ->pluck('value', 'setting')
+                ->toArray();
 
-                    if ($newValue !== null) {
-                        Capsule::table('tblpaymentgateways')
-                            ->where('gateway', $gatewayName)
-                            ->where('setting', $setting->setting)
-                            ->update(['value' => $newValue]);
+            if (empty($existingSettings)) {
+                // Not active/configured at all in WHMCS
+                continue;
+            }
+
+            $settingsToSet = [];
+
+            // 1. Load expected keys for this gateway
+            if (isset($gatewayExpectedKeys[$gatewayName])) {
+                foreach ($gatewayExpectedKeys[$gatewayName] as $dbSetting => $bgwField) {
+                    if ($bgwField === 'client_id') {
+                        $settingsToSet[$dbSetting] = $bgw['client_id'] ?? '';
+                    } elseif ($bgwField === 'secret') {
+                        $settingsToSet[$dbSetting] = $bgw['secret'] ?? '';
+                    } elseif ($bgwField === 'test_mode') {
+                        $settingsToSet[$dbSetting] = !empty($bgw['test_mode']) ? 'on' : '';
                     }
+                }
+            }
+
+            // 2. Load friendly name and currency conversion if configured
+            if (!empty($bgw['friendly_name'])) {
+                $settingsToSet['name'] = $bgw['friendly_name'];
+            }
+            if (!empty($bgw['convert_to'])) {
+                $curr = Capsule::table('tblcurrencies')->where('code', $bgw['convert_to'])->first();
+                if ($curr) {
+                    $settingsToSet['convertto'] = $curr->id;
+                }
+            }
+
+            // 3. Fallback: match any other existing keys in database case-insensitively (for custom/unmapped gateways)
+            foreach ($existingSettings as $dbSetting => $dbValue) {
+                $sName = strtolower($dbSetting);
+                if (in_array($sName, ['clientid', 'client_id', 'client-id', 'publishablekey', 'publishkey', 'googlemerchantid', 'merchantid'])) {
+                    $settingsToSet[$dbSetting] = $bgw['client_id'] ?? '';
+                } elseif (in_array($sName, ['clientsecret', 'client_secret', 'secret', 'secretkey', 'secret_key', 'apikey', 'securitykey'])) {
+                    $settingsToSet[$dbSetting] = $bgw['secret'] ?? '';
+                } elseif (in_array($sName, ['testmode', 'test_mode', 'sandbox', 'usesandbox'])) {
+                    $currentVal = $dbValue;
+                    if ($currentVal === '1' || $currentVal === 1 || is_numeric($currentVal)) {
+                        $settingsToSet[$dbSetting] = !empty($bgw['test_mode']) ? $currentVal : '0';
+                    } else {
+                        $settingsToSet[$dbSetting] = !empty($bgw['test_mode']) ? 'on' : '';
+                    }
+                }
+            }
+
+            // Apply settings
+            foreach ($settingsToSet as $dbSetting => $newValue) {
+                if (array_key_exists($dbSetting, $existingSettings)) {
+                    // Update: backup original value if not already backed up
+                    if (!isset($originals[$gatewayName][$dbSetting])) {
+                        $originals[$gatewayName][$dbSetting] = [
+                            'action' => 'update',
+                            'value'  => $existingSettings[$dbSetting]
+                        ];
+                    }
+                    Capsule::table('tblpaymentgateways')
+                        ->where('gateway', $gatewayName)
+                        ->where('setting', $dbSetting)
+                        ->update(['value' => $newValue]);
+                } else {
+                    // Insert: track as inserted
+                    if (!isset($originals[$gatewayName][$dbSetting])) {
+                        $originals[$gatewayName][$dbSetting] = [
+                            'action' => 'insert'
+                        ];
+                    }
+                    Capsule::table('tblpaymentgateways')->insert([
+                        'gateway' => $gatewayName,
+                        'setting' => $dbSetting,
+                        'value'   => $newValue
+                    ]);
                 }
             }
         } catch (\Exception $e) {}
     }
 
-    if (count($originals) > 0) {
-        register_shutdown_function(function() use ($originals) {
+    // Register shutdown restore and lock release function
+    if (count($originals) > 0 || $lockAcquired) {
+        register_shutdown_function(function() use ($originals, $lockAcquired) {
             foreach ($originals as $gwName => $gwSettings) {
-                foreach ($gwSettings as $settingName => $value) {
+                foreach ($gwSettings as $settingName => $info) {
                     try {
-                        Capsule::table('tblpaymentgateways')
-                            ->where('gateway', $gwName)
-                            ->where('setting', $settingName)
-                            ->update(['value' => $value]);
+                        if ($info['action'] === 'update') {
+                            Capsule::table('tblpaymentgateways')
+                                ->where('gateway', $gwName)
+                                ->where('setting', $settingName)
+                                ->update(['value' => $info['value']]);
+                        } elseif ($info['action'] === 'insert') {
+                            Capsule::table('tblpaymentgateways')
+                                ->where('gateway', $gwName)
+                                ->where('setting', $settingName)
+                                ->delete();
+                        }
                     } catch (\Exception $e) {}
                 }
+            }
+
+            // Release MySQL lock
+            if ($lockAcquired) {
+                try {
+                    Capsule::select("SELECT RELEASE_LOCK('multibrand_gateway_override')");
+                } catch (\Exception $e) {}
             }
         });
     }
@@ -4298,6 +5152,17 @@ if (!defined('ADMIN_AREA')) {
     } catch (\Exception $e) {}
 }
 
+function getalldataofbrand(){
+    global $GLOBALS;
+    $host = $_SERVER['HTTP_HOST'];
+    $systemurl = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? "https" : "http") . "://$host";
+    $GLOBALS['CONFIG']['SystemURL'] = $systemurl;
+    $GLOBALS['CONFIG']['Domain'] = $host;
 
+    $return['SystemURL'] = $systemurl;
+    $return['Domain'] = $host;
+    return $return;
+}
+getalldataofbrand();
 
 
