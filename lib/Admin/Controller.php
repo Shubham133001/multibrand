@@ -38,6 +38,7 @@ class Controller
             'default_currency' => ['type' => 'string', 'default' => NULL],
             'products_branding' => ['type' => 'boolean', 'default' => 0],
             'price_override' => ['type' => 'boolean', 'default' => 0],
+            'pricing_overrides' => ['type' => 'text', 'default' => NULL],
             'brand_switcher' => ['type' => 'boolean', 'default' => 0],
             'ticket_departments' => ['type' => 'text', 'default' => NULL],
             'order_template' => ['type' => 'string', 'default' => NULL],
@@ -112,7 +113,7 @@ class Controller
             </a>
         </div>';
 
-        $output .= '<table class="' . (count($brands) > 0 ? 'datatable' : 'table-no-datatable') . '" width="100%" border="0" cellspacing="1" cellpadding="3">
+        $output .= '<table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
             <thead>
                 <tr>
                     <th>Brand Name</th>
@@ -138,7 +139,6 @@ class Controller
                     <td class="text-center">' . $statusBadge . '</td>
                     <td>' . htmlspecialchars($createdAt) . '</td>
                     <td class="text-center">
-                        <a href="' . $modulelink . '&action=relations&id=' . $brand->id . '" class="btn btn-sm btn-info" style="margin-right: 5px;" title="Relations Dashboard"><i class="fas fa-exchange-alt"></i></a>
                         <a href="' . $modulelink . '&action=edit&id=' . $brand->id . '" class="btn btn-sm btn-primary" style="margin-right: 5px;" title="Edit Brand"><i class="fas fa-edit"></i></a>
                         <a href="' . $modulelink . '&action=delete&id=' . $brand->id . '" class="btn btn-sm btn-danger" onclick="return confirm(\'Are you sure you want to delete this brand?\')" title="Delete Brand"><i class="fas fa-trash-alt"></i></a>
                     </td>
@@ -149,6 +149,19 @@ class Controller
         }
 
         $output .= '</tbody></table>';
+
+        $output .= '
+        <script type="text/javascript">
+        jQuery("table.datatable").each(function() {
+            if (jQuery(this).find("tbody td[colspan]").length > 0) {
+                var tbl = jQuery(this);
+                tbl.removeClass("datatable").addClass("datatable-placeholder");
+                jQuery(document).ready(function() {
+                    tbl.addClass("datatable").removeClass("datatable-placeholder");
+                });
+            }
+        });
+        </script>';
 
         return print_r($output);
     }
@@ -793,13 +806,12 @@ class Controller
         }
 
         $services = [];
-        if (!empty($clientIds)) {
+        try {
             $services = Capsule::table('tblhosting')
                 ->join('tblproducts', 'tblhosting.packageid', '=', 'tblproducts.id')
                 ->join('tblclients', 'tblhosting.userid', '=', 'tblclients.id')
                 ->join('mod_multibrand_service_brands', 'tblhosting.id', '=', 'mod_multibrand_service_brands.service_id')
                 ->where('mod_multibrand_service_brands.brand_id', $brand->id)
-                ->whereIn('tblhosting.userid', $clientIds)
                 ->select(
                     'tblhosting.*', 
                     'tblproducts.name as product_name', 
@@ -807,7 +819,7 @@ class Controller
                     'tblclients.lastname'
                 )
                 ->get();
-        }
+        } catch (\Exception $e) {}
 
         // Fetch explicitly assigned addons for this brand
         $assignedAddons = [];
@@ -889,17 +901,8 @@ class Controller
             $deptIds = array_filter(array_map('intval', explode(',', $brand->ticket_departments ?: '')));
             $query = Capsule::table('tbltickets')
                 ->join('tblclients', 'tbltickets.userid', '=', 'tblclients.id')
-                ->leftJoin('mod_multibrand_ticket_brands', 'tbltickets.id', '=', 'mod_multibrand_ticket_brands.ticket_id');
-            
-            $query->where(function($q) use ($clientIds, $deptIds, $brand) {
-                $q->where('mod_multibrand_ticket_brands.brand_id', $brand->id);
-                if (!empty($clientIds)) {
-                    $q->orWhereIn('tbltickets.userid', $clientIds);
-                }
-                if (!empty($deptIds)) {
-                    $q->orWhereIn('tbltickets.did', $deptIds); // Corrected did column bug
-                }
-            });
+                ->join('mod_multibrand_ticket_brands', 'tbltickets.id', '=', 'mod_multibrand_ticket_brands.ticket_id')
+                ->where('mod_multibrand_ticket_brands.brand_id', $brand->id);
             
             $tickets = $query->select('tbltickets.*', 'tblclients.firstname', 'tblclients.lastname')
                 ->orderBy('tbltickets.id', 'desc')
@@ -1016,6 +1019,70 @@ class Controller
                 align-items: center;
                 gap: 8px;
             }
+            /* Tab search filter row */
+            .tab-search-row {
+                display: none;
+                margin-bottom: 12px;
+                animation: slideDown 0.2s ease;
+            }
+            .tab-search-row.open {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .tab-search-row input {
+                flex: 1;
+                padding: 6px 12px;
+                border: 1px solid #ccc;
+                border-radius: 20px;
+                font-size: 0.9em;
+                outline: none;
+                transition: border-color 0.2s;
+            }
+            .tab-search-row input:focus {
+                border-color: #007bff;
+                box-shadow: 0 0 0 2px rgba(0,123,255,0.15);
+            }
+            .tab-search-row .clear-search-btn {
+                background: none;
+                border: none;
+                color: #999;
+                cursor: pointer;
+                font-size: 1em;
+                padding: 0 6px;
+            }
+            .tab-search-row .clear-search-btn:hover { color: #d9534f; }
+            /* Action circle btn active state */
+            .action-circle-btn.active {
+                background: #007bff;
+                color: #fff;
+                border-color: #007bff;
+            }
+            @keyframes slideDown {
+                from { opacity: 0; transform: translateY(-6px); }
+                to   { opacity: 1; transform: translateY(0); }
+            }
+            /* Help popover custom */
+            .tab-help-popover {
+                display: none;
+                position: absolute;
+                right: 0;
+                top: 42px;
+                z-index: 1050;
+                background: #fff;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                padding: 14px 16px;
+                min-width: 280px;
+                max-width: 340px;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+                font-size: 0.88em;
+                color: #444;
+                line-height: 1.5;
+            }
+            .tab-help-popover.open { display: block; animation: slideDown 0.18s ease; }
+            .tab-help-popover h6 { margin: 0 0 8px; font-weight: 700; color: #333; font-size: 1em; }
+            .action-bar-right { position: relative; }
             .action-circle-btn {
                 width: 32px;
                 height: 32px;
@@ -1196,7 +1263,7 @@ class Controller
             </div>
         </div>
 
-        <form method="post" action="' . $modulelink . '&action=save" enctype="multipart/form-data" novalidate>
+        <form method="post" action="' . $modulelink . '&action=save" enctype="multipart/form-data" novalidate>' . generate_token() . '' . generate_token() . '
             <input type="hidden" name="id" value="' . $brand->id . '">
             <input type="hidden" name="status_submitted" value="1">
              <input type="hidden" name="active_tab" id="active_tab" value="' . htmlspecialchars($activeTab) . '">
@@ -1208,7 +1275,7 @@ class Controller
                     <div style="background: #fff; border: 1px solid #e1e1e1; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); overflow: hidden; height: 100%;">
                         <div style="padding: 15px 20px; border-bottom: 1px solid #f0f0f0; display: flex; align-items: center; justify-content: space-between;">
                             <span style="font-weight: bold; color: ' . $brandColor . '; text-transform: uppercase; font-size: 0.95em;"><i class="fas fa-info-circle" style="margin-right: 8px;"></i> Brand Information</span>
-                            <a class="action-circle-btn" style="width: 24px; height: 24px; font-size: 0.8em;" href=""><i class="fas fa-sync-alt"></i></a>
+                           <!-- <a class="action-circle-btn" style="width: 24px; height: 24px; font-size: 0.8em;" href=""><i class="fas fa-sync-alt"></i></a> -->
                         </div>
                         
                         <div style="padding: 20px;">
@@ -1703,6 +1770,13 @@ class Controller
 
                                     try {
                                         gateways = JSON.parse(gatewaysTextarea.value || "[]");
+                                        if (Array.isArray(gateways)) {
+                                            gateways.forEach(function(g) {
+                                                if (g.gateway === "paypalrest" && g.friendly_name === "PayPal REST") {
+                                                    g.friendly_name = "PayPal";
+                                                }
+                                            });
+                                        }
                                     } catch(e) {
                                         gateways = [];
                                     }
@@ -1757,6 +1831,9 @@ class Controller
 
                                             var nameSpan = document.createElement("span");
                                             var displayName = gw.friendly_name || gw.gateway;
+                                            if (displayName === "PayPal REST") {
+                                                displayName = "PayPal";
+                                            }
                                             if (gw.is_whmcs) {
                                                 displayName += " [WHMCS]";
                                             }
@@ -1912,23 +1989,48 @@ class Controller
                                                 saveState();
                                             };
 
+                                            var clientIdLabel = "Client ID";
+                                            var clientIdDesc = "Provide the client ID from REST API Application.";
+                                            var secretLabel = "Secret";
+                                            var secretDesc = "Provide the secret from REST API Application.";
+                                            var testModeLabel = "Test Mode";
+                                            var testModeDesc = "Use this option if you want to use the PayPal sandbox API.";
+                                            var showSecret = true;
+
+                                            if (gw.gateway === "stripe") {
+                                                clientIdLabel = "Publishable Key";
+                                                clientIdDesc = "Provide the publishable key from Stripe Dashboard.";
+                                                secretLabel = "Secret Key";
+                                                secretDesc = "Provide the secret key from Stripe Dashboard.";
+                                                testModeLabel = "Test Mode";
+                                                testModeDesc = "Use this option if you want to use the Stripe test environment.";
+                                            } else if (gw.gateway === "paypal") {
+                                                clientIdLabel = "PayPal Email";
+                                                clientIdDesc = "Provide your PayPal account email address.";
+                                                showSecret = false;
+                                                testModeLabel = "Sandbox Mode";
+                                                testModeDesc = "Use this option if you want to use the PayPal sandbox environment.";
+                                            }
+
                                             var clientIdGroup = document.createElement("div");
                                             clientIdGroup.className = "form-group-mb";
-                                            clientIdGroup.innerHTML = "<label style=\"font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;\">Client ID</label><input type=\"text\" id=\"gw_client_id\" class=\"form-control\" value=\"" + (gw.client_id || "") + "\"><small class=\"text-muted\" style=\"color: #888; font-size: 0.82em; display: block; margin-top: 4px;\">Provide the client ID from REST API Application.</small>";
+                                            clientIdGroup.innerHTML = "<label style=\"font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;\">" + clientIdLabel + "</label><input type=\"text\" id=\"gw_client_id\" class=\"form-control\" value=\"" + (gw.client_id || "") + "\"><small class=\"text-muted\" style=\"color: #888; font-size: 0.82em; display: block; margin-top: 4px;\">" + clientIdDesc + "</small>";
                                             fieldsGrid.appendChild(clientIdGroup);
                                             clientIdGroup.querySelector("#gw_client_id").oninput = function() {
                                                 gw.client_id = this.value;
                                                 saveState();
                                             };
 
-                                            var secretGroup = document.createElement("div");
-                                            secretGroup.className = "form-group-mb";
-                                            secretGroup.innerHTML = "<label style=\"font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;\">Secret</label><input type=\"password\" id=\"gw_secret\" class=\"form-control\" value=\"" + (gw.secret || "") + "\" style=\"letter-spacing: 2px;\"><small class=\"text-muted\" style=\"color: #888; font-size: 0.82em; display: block; margin-top: 4px;\">Provide the secret from REST API Application.</small>";
-                                            fieldsGrid.appendChild(secretGroup);
-                                            secretGroup.querySelector("#gw_secret").oninput = function() {
-                                                gw.secret = this.value;
-                                                saveState();
-                                            };
+                                            if (showSecret) {
+                                                var secretGroup = document.createElement("div");
+                                                secretGroup.className = "form-group-mb";
+                                                secretGroup.innerHTML = "<label style=\"font-weight: bold; color: #555; display: block; margin-bottom: 5px; font-size: 0.92em;\">" + secretLabel + "</label><input type=\"password\" id=\"gw_secret\" class=\"form-control\" value=\"" + (gw.secret || "") + "\" style=\"letter-spacing: 2px;\"><small class=\"text-muted\" style=\"color: #888; font-size: 0.82em; display: block; margin-top: 4px;\">" + secretDesc + "</small>";
+                                                fieldsGrid.appendChild(secretGroup);
+                                                secretGroup.querySelector("#gw_secret").oninput = function() {
+                                                    gw.secret = this.value;
+                                                    saveState();
+                                                };
+                                            }
 
                                             var testModeRow = document.createElement("div");
                                             testModeRow.style.display = "flex";
@@ -1940,7 +2042,7 @@ class Controller
                                             var testBadgeText = gw.test_mode ? "Enabled" : "Disabled";
                                             var testBadgeColor = gw.test_mode ? "#f0ad4e" : "#777";
 
-                                            testModeRow.innerHTML = "<label class=\"mb-switch\" style=\"flex-shrink: 0; margin: 0;\"><input type=\"checkbox\" id=\"gw_test_mode_chk\" " + isTestChecked + "><span class=\"mb-slider\"></span></label><div style=\"display: flex; flex-direction: column; gap: 4px;\"><div style=\"display: flex; align-items: center; gap: 8px;\"><span style=\"font-weight: 600; color: #444; font-size: 1em;\">Test Mode</span><span id=\"gw_test_badge\" class=\"status-badge\" style=\"background-color: " + testBadgeColor + "; color: #fff; font-size: 0.72em; padding: 2px 8px; border-radius: 3px; font-weight: bold; text-transform: uppercase;\">" + testBadgeText + "</span></div><span style=\"font-size: 0.85em; color: #777;\">Use this option if you want to use the PayPal sandbox API.</span></div>";
+                                            testModeRow.innerHTML = "<label class=\"mb-switch\" style=\"flex-shrink: 0; margin: 0;\"><input type=\"checkbox\" id=\"gw_test_mode_chk\" " + isTestChecked + "><span class=\"mb-slider\"></span></label><div style=\"display: flex; flex-direction: column; gap: 4px;\"><div style=\"display: flex; align-items: center; gap: 8px;\"><span style=\"font-weight: 600; color: #444; font-size: 1em;\">" + testModeLabel + "</span><span id=\"gw_test_badge\" class=\"status-badge\" style=\"background-color: " + testBadgeColor + "; color: #fff; font-size: 0.72em; padding: 2px 8px; border-radius: 3px; font-weight: bold; text-transform: uppercase;\">" + testBadgeText + "</span></div><span style=\"font-size: 0.85em; color: #777;\">" + testModeDesc + "</span></div>";
                                             fieldsGrid.appendChild(testModeRow);
 
                                             var testModeChk = testModeRow.querySelector("#gw_test_mode_chk");
@@ -2477,14 +2579,14 @@ class Controller
                             <i class="fas fa-cubes" style="margin-right: 8px;"></i> Branded Products (' . count($brandedProducts) . ')
                         </h4>
                         <div class="action-bar-right" style="display: flex; gap: 8px; align-items: center;">
-                            <a class="action-circle-btn pricing-search-btn" title="Search"><i class="fas fa-search"></i></a>
-                            <a href="#modal-assign-product" data-toggle="modal" class="action-circle-btn" title="Assign Product"><i class="fas fa-plus"></i></a>
-                            <a href="#modal-bulk-add-products" data-toggle="modal" class="action-circle-btn" title="Bulk Add Products"><i class="fas fa-cog"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-price-products"><i class="fas fa-search"></i></a>
+                            <a href="#modal-assign-product" data-toggle="modal" data-target="#modal-assign-product" class="action-circle-btn" title="Assign Product"><i class="fas fa-plus"></i></a>
+                            <a href="#modal-bulk-add-products" data-toggle="modal" data-target="#modal-bulk-add-products" class="action-circle-btn" title="Bulk Add Products"><i class="fas fa-cog"></i></a>
                         </div>
                     </div>
-                    
-                    <div class="pricing-search-wrapper" style="display: none; margin-bottom: 15px;">
-                        <input type="text" class="form-control search-pricing-table" placeholder="Search branded products..." style="width: 100%; max-width: 300px; padding: 6px 12px; font-family: inherit;">
+                    <div class="tab-search-row" id="search-row-price-products">
+                        <input type="text" class="tab-search-input" placeholder="Filter products by name, payment type..." autocomplete="off">
+                        <button class="clear-search-btn" title="Close"><i class="fas fa-times"></i></button>
                     </div>
 
                     <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
@@ -2523,14 +2625,14 @@ class Controller
                             <i class="fas fa-puzzle-piece" style="margin-right: 8px;"></i> Branded Addons (' . count($brandedAddons) . ')
                         </h4>
                         <div class="action-bar-right" style="display: flex; gap: 8px; align-items: center;">
-                            <a class="action-circle-btn pricing-search-btn" title="Search"><i class="fas fa-search"></i></a>
-                            <a href="#modal-assign-addon" data-toggle="modal" class="action-circle-btn" title="Assign Addon"><i class="fas fa-plus"></i></a>
-                            <a href="#modal-bulk-add-addons" data-toggle="modal" class="action-circle-btn" title="Bulk Add Addons"><i class="fas fa-cog"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-price-addons"><i class="fas fa-search"></i></a>
+                            <a href="#modal-assign-addon" data-toggle="modal" data-target="#modal-assign-addon" class="action-circle-btn" title="Assign Addon"><i class="fas fa-plus"></i></a>
+                            <a href="#modal-bulk-add-addons" data-toggle="modal" data-target="#modal-bulk-add-addons" class="action-circle-btn" title="Bulk Add Addons"><i class="fas fa-cog"></i></a>
                         </div>
                     </div>
-                    
-                    <div class="pricing-search-wrapper" style="display: none; margin-bottom: 15px;">
-                        <input type="text" class="form-control search-pricing-table" placeholder="Search branded addons..." style="width: 100%; max-width: 300px; padding: 6px 12px; font-family: inherit;">
+                    <div class="tab-search-row" id="search-row-price-addons">
+                        <input type="text" class="tab-search-input" placeholder="Filter addons by name, billing cycle..." autocomplete="off">
+                        <button class="clear-search-btn" title="Close"><i class="fas fa-times"></i></button>
                     </div>
 
                     <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
@@ -2567,14 +2669,14 @@ class Controller
                             <i class="fas fa-globe" style="margin-right: 8px;"></i> Branded Domains (' . count($brandedDomains) . ')
                         </h4>
                         <div class="action-bar-right" style="display: flex; gap: 8px; align-items: center;">
-                            <a class="action-circle-btn pricing-search-btn" title="Search"><i class="fas fa-search"></i></a>
-                            <a href="#modal-assign-domain" data-toggle="modal" class="action-circle-btn" title="Assign Domain"><i class="fas fa-plus"></i></a>
-                            <a href="#modal-bulk-add-domains" data-toggle="modal" class="action-circle-btn" title="Bulk Add Domains"><i class="fas fa-cog"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-price-domains"><i class="fas fa-search"></i></a>
+                            <a href="#modal-assign-domain" data-toggle="modal" data-target="#modal-assign-domain" class="action-circle-btn" title="Assign Domain"><i class="fas fa-plus"></i></a>
+                            <a href="#modal-bulk-add-domains" data-toggle="modal" data-target="#modal-bulk-add-domains" class="action-circle-btn" title="Bulk Add Domains"><i class="fas fa-cog"></i></a>
                         </div>
                     </div>
-                    
-                    <div class="pricing-search-wrapper" style="display: none; margin-bottom: 15px;">
-                        <input type="text" class="form-control search-pricing-table" placeholder="Search branded domains..." style="width: 100%; max-width: 300px; padding: 6px 12px; font-family: inherit;">
+                    <div class="tab-search-row" id="search-row-price-domains">
+                        <input type="text" class="tab-search-input" placeholder="Filter domains by TLD/extension..." autocomplete="off">
+                        <button class="clear-search-btn" title="Close"><i class="fas fa-times"></i></button>
                     </div>
 
                     <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
@@ -2609,14 +2711,14 @@ class Controller
                             <i class="fas fa-box-open" style="margin-right: 8px;"></i> Branded Bundles (' . count($brandedBundles) . ')
                         </h4>
                         <div class="action-bar-right" style="display: flex; gap: 8px; align-items: center;">
-                            <a class="action-circle-btn pricing-search-btn" title="Search"><i class="fas fa-search"></i></a>
-                            <a href="#modal-assign-bundle" data-toggle="modal" class="action-circle-btn" title="Assign Bundle"><i class="fas fa-plus"></i></a>
-                            <a href="#modal-bulk-add-bundles" data-toggle="modal" class="action-circle-btn" title="Bulk Add Bundles"><i class="fas fa-cog"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-price-bundles"><i class="fas fa-search"></i></a>
+                            <a href="#modal-assign-bundle" data-toggle="modal" data-target="#modal-assign-bundle" class="action-circle-btn" title="Assign Bundle"><i class="fas fa-plus"></i></a>
+                            <a href="#modal-bulk-add-bundles" data-toggle="modal" data-target="#modal-bulk-add-bundles" class="action-circle-btn" title="Bulk Add Bundles"><i class="fas fa-cog"></i></a>
                         </div>
                     </div>
-                    
-                    <div class="pricing-search-wrapper" style="display: none; margin-bottom: 15px;">
-                        <input type="text" class="form-control search-pricing-table" placeholder="Search branded bundles..." style="width: 100%; max-width: 300px; padding: 6px 12px; font-family: inherit;">
+                    <div class="tab-search-row" id="search-row-price-bundles">
+                        <input type="text" class="tab-search-input" placeholder="Filter bundles by name..." autocomplete="off">
+                        <button class="clear-search-btn" title="Close"><i class="fas fa-times"></i></button>
                     </div>
 
                     <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
@@ -2661,8 +2763,7 @@ class Controller
                             <select id="add_brand_gateway_select" class="form-control" style="width: 100%; height: 38px; font-size: 0.95em;">
                                 <option value="">Please select ...</option>
                                 <optgroup label="Branded Gateways">
-                                    <option value="paypal" data-whmcs="false">PayPal</option>
-                                    <option value="paypalrest" data-whmcs="false">PayPal REST</option>
+                                    <option value="paypalrest" data-whmcs="false">PayPal</option>
                                     <option value="stripe" data-whmcs="false">Stripe</option>
                                 </optgroup>
                             </select>
@@ -2686,7 +2787,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-cube" style="margin-right: 8px;"></i> Assign Product</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">
+                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="type" value="product">
                         <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
@@ -2712,7 +2813,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-puzzle-piece" style="margin-right: 8px;"></i> Assign Addon</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">
+                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="type" value="addon">
                         <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
@@ -2738,7 +2839,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-globe" style="margin-right: 8px;"></i> Assign Domain</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">
+                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="type" value="domain">
                         <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
@@ -2764,7 +2865,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-box-open" style="margin-right: 8px;"></i> Assign Bundle</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">
+                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="type" value="bundle">
                         <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
@@ -2790,7 +2891,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-cubes" style="margin-right: 8px;"></i> Bulk Add Products</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">
+                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="type" value="product">
                         <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
@@ -2812,7 +2913,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-cubes" style="margin-right: 8px;"></i> Bulk Add Addons</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">
+                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="type" value="addon">
                         <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
@@ -2834,7 +2935,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-globe" style="margin-right: 8px;"></i> Bulk Add Domains</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">
+                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="type" value="domain">
                         <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
@@ -2856,7 +2957,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-box-open" style="margin-right: 8px;"></i> Bulk Add Bundles</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">
+                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="type" value="bundle">
                         <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
@@ -2878,7 +2979,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-dollar-sign" style="margin-right: 8px;"></i> Pricing: <span class="override-item-name" style="color: ' . $brandColor . ';">-</span></h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=save_pricing_override">
+                    <form method="post" action="' . $modulelink . '&action=save_pricing_override">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="type" value="">
                         <input type="hidden" name="relid" value="">
@@ -2928,13 +3029,18 @@ class Controller
                             <i class="fas fa-users" style="margin-right: 8px;"></i> Clients
                         </h4>
                         <div class="action-bar-right">
-                            <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-clients"><i class="fas fa-search"></i></a>
                             <a href="#modal-assign-client" data-toggle="modal" data-target="#modal-assign-client" class="action-circle-btn" title="Add Relation"><i class="fas fa-plus"></i></a>
-                            <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
+                            <a class="action-circle-btn tab-help-btn" title="Help" data-help-title="Clients Tab" data-help-text="This tab shows all clients linked to this brand. Use the + button to assign a client to this brand. Use the trash icon to unlink a client. Use Search to filter the list."><i class="fas fa-question"></i></a>
+                            <div class="tab-help-popover" id="help-popover-clients"></div>
                         </div>
                     </div>
+                    <div class="tab-search-row" id="search-row-clients">
+                        <input type="text" class="tab-search-input" placeholder="Filter clients by name, company, ID..." autocomplete="off">
+                        <button class="clear-search-btn" title="Clear"><i class="fas fa-times"></i></button>
+                    </div>
 
-                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_client_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_client_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
                             <thead>
@@ -2989,15 +3095,20 @@ class Controller
 
                 <!-- SERVICES TAB -->
                 <div class="tab-pane" id="tab-services">
-                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
                         <h4 style="margin: 0; font-weight: bold; color: ' . $brandColor . '; text-transform: uppercase; font-size: 1.1em;">
                             <i class="fas fa-cubes" style="margin-right: 8px;"></i> Services
                         </h4>
                         <div class="action-bar-right">
-                            <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-services"><i class="fas fa-search"></i></a>
                             <a href="#modal-add-service" data-toggle="modal" data-target="#modal-add-service" class="action-circle-btn" title="Add Service Relation"><i class="fas fa-plus"></i></a>
-                            <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
+                            <a class="action-circle-btn tab-help-btn" title="Help" data-help-title="Services Tab" data-help-text="This tab shows all hosting services, addons, and domains linked to this brand. Use the + button to assign new service relations. Use the search to filter by product name or domain."><i class="fas fa-question"></i></a>
+                            <div class="tab-help-popover" id="help-popover-services"></div>
                         </div>
+                    </div>
+                    <div class="tab-search-row" id="search-row-services">
+                        <input type="text" class="tab-search-input" placeholder="Filter services by name, domain, status..." autocomplete="off" data-table="services-table">
+                        <button class="clear-search-btn" title="Clear"><i class="fas fa-times"></i></button>
                     </div>
 
                     <ul class="relations-tabs" role="tablist" style="margin-top: 10px; margin-bottom: 20px; font-size: 0.95em; border-bottom: 1px solid #ddd; display: flex; list-style: none; padding: 0;">
@@ -3009,7 +3120,7 @@ class Controller
                     <div class="tab-content" style="border: none; padding: 0; box-shadow: none; background: transparent;">
                         <!-- Services & Products Sub-tab -->
                         <div class="tab-pane active" id="subtab-hosting">
-                            <form method="post" action="' . $modulelink . '&action=bulk_unlink_services">
+                            <form method="post" action="' . $modulelink . '&action=bulk_unlink_services">' . generate_token() . '' . generate_token() . '
                                 <input type="hidden" name="brand_id" value="' . $brand->id . '">
                                 <input type="hidden" name="redirect" value="edit">
                                 <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
@@ -3053,7 +3164,7 @@ class Controller
 
                         <!-- Addons Sub-tab -->
                         <div class="tab-pane" id="subtab-addons">
-                            <form method="post" action="' . $modulelink . '&action=bulk_unlink_addons">
+                            <form method="post" action="' . $modulelink . '&action=bulk_unlink_addons">' . generate_token() . '' . generate_token() . '
                                 <input type="hidden" name="brand_id" value="' . $brand->id . '">
                                 <input type="hidden" name="redirect" value="edit">
                                 <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
@@ -3098,7 +3209,7 @@ class Controller
 
                         <!-- Domains Sub-tab -->
                         <div class="tab-pane" id="subtab-domains">
-                            <form method="post" action="' . $modulelink . '&action=bulk_unlink_domains">
+                            <form method="post" action="' . $modulelink . '&action=bulk_unlink_domains">' . generate_token() . '' . generate_token() . '
                                 <input type="hidden" name="brand_id" value="' . $brand->id . '">
                                 <input type="hidden" name="redirect" value="edit">
                                 <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
@@ -3142,18 +3253,23 @@ class Controller
 
                 <!-- INVOICES TAB -->
                 <div class="tab-pane" id="tab-invoices">
-                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
                         <h4 style="margin: 0; font-weight: bold; color: ' . $brandColor . '; text-transform: uppercase; display: flex; align-items: center; font-size: 1.1em;">
                             <i class="fas fa-file-invoice-dollar" style="margin-right: 8px;"></i> Invoices
                         </h4>
                         <div class="action-bar-right">
-                            <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-invoices"><i class="fas fa-search"></i></a>
                             <a href="#modal-add-invoice" data-toggle="modal" data-target="#modal-add-invoice" class="action-circle-btn" title="Add Invoice"><i class="fas fa-plus"></i></a>
-                            <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
+                            <a class="action-circle-btn tab-help-btn" title="Help" data-help-title="Invoices Tab" data-help-text="This tab shows all invoices linked to this brand. Use the + button to assign an existing invoice to this brand. Use the trash icon to unlink an invoice. Use Search to filter by invoice number, client name, or status."><i class="fas fa-question"></i></a>
+                            <div class="tab-help-popover" id="help-popover-invoices"></div>
                         </div>
                     </div>
+                    <div class="tab-search-row" id="search-row-invoices">
+                        <input type="text" class="tab-search-input" placeholder="Filter invoices by number, client, status..." autocomplete="off">
+                        <button class="clear-search-btn" title="Clear"><i class="fas fa-times"></i></button>
+                    </div>
 
-                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_invoices">
+                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_invoices">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="redirect" value="edit">
                         <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
@@ -3234,13 +3350,18 @@ class Controller
                             <i class="fas fa-file-signature" style="margin-right: 8px;"></i> Quotes
                         </h4>
                         <div class="action-bar-right">
-                            <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-quotes"><i class="fas fa-search"></i></a>
                             <a href="#modal-assign-quote" data-toggle="modal" data-target="#modal-assign-quote" class="action-circle-btn" title="Add Quote"><i class="fas fa-plus"></i></a>
-                            <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
+                            <a class="action-circle-btn tab-help-btn" title="Help" data-help-title="Quotes Tab" data-help-text="This tab shows all quotes linked to this brand. Use the + button to assign a quote. Use Search to filter by ID, subject, or client."><i class="fas fa-question"></i></a>
+                            <div class="tab-help-popover" id="help-popover-quotes"></div>
                         </div>
                     </div>
+                    <div class="tab-search-row" id="search-row-quotes">
+                        <input type="text" class="tab-search-input" placeholder="Filter quotes by ID, subject, client..." autocomplete="off">
+                        <button class="clear-search-btn" title="Clear"><i class="fas fa-times"></i></button>
+                    </div>
 
-                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_quotes">
+                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_quotes">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="redirect" value="edit">
                         <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
@@ -3312,13 +3433,18 @@ class Controller
                             <i class="fas fa-ticket-alt" style="margin-right: 8px;"></i> Tickets
                         </h4>
                         <div class="action-bar-right">
-                            <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-tickets"><i class="fas fa-search"></i></a>
                             <a href="#modal-add-ticket" data-toggle="modal" data-target="#modal-add-ticket" class="action-circle-btn" title="Add Ticket"><i class="fas fa-plus"></i></a>
-                            <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
+                            <a class="action-circle-btn tab-help-btn" title="Help" data-help-title="Tickets Tab" data-help-text="This tab shows all support tickets linked to this brand. Use the + button to assign a ticket. Use Search to filter by ID, subject, or ticket number."><i class="fas fa-question"></i></a>
+                            <div class="tab-help-popover" id="help-popover-tickets"></div>
                         </div>
                     </div>
+                    <div class="tab-search-row" id="search-row-tickets">
+                        <input type="text" class="tab-search-input" placeholder="Filter tickets by ID, subject, number..." autocomplete="off">
+                        <button class="clear-search-btn" title="Clear"><i class="fas fa-times"></i></button>
+                    </div>
 
-                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_tickets">
+                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_tickets">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="redirect" value="edit">
                         <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
@@ -3403,13 +3529,18 @@ class Controller
                             <i class="fas fa-book" style="margin-right: 8px;"></i> Knowledgebase
                         </h4>
                         <div class="action-bar-right">
-                            <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-kb"><i class="fas fa-search"></i></a>
                             <a href="#modal-add-kb" data-toggle="modal" data-target="#modal-add-kb" class="action-circle-btn" title="Add Article"><i class="fas fa-plus"></i></a>
-                            <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
+                            <a class="action-circle-btn tab-help-btn" title="Help" data-help-title="Knowledge Base Tab" data-help-text="This tab shows all knowledge base articles linked to this brand. Use the + button to assign an article. Use Search to filter by title or ID."><i class="fas fa-question"></i></a>
+                            <div class="tab-help-popover" id="help-popover-kb"></div>
                         </div>
                     </div>
+                    <div class="tab-search-row" id="search-row-kb">
+                        <input type="text" class="tab-search-input" placeholder="Filter articles by title, ID..." autocomplete="off">
+                        <button class="clear-search-btn" title="Clear"><i class="fas fa-times"></i></button>
+                    </div>
 
-                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_kb_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_kb_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
                             <thead>
@@ -3464,13 +3595,18 @@ class Controller
                             <i class="fas fa-download" style="margin-right: 8px;"></i> Downloads
                         </h4>
                         <div class="action-bar-right">
-                            <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-downloads"><i class="fas fa-search"></i></a>
                             <a href="#modal-add-download" data-toggle="modal" data-target="#modal-add-download" class="action-circle-btn" title="Add Download"><i class="fas fa-plus"></i></a>
-                            <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
+                            <a class="action-circle-btn tab-help-btn" title="Help" data-help-title="Downloads Tab" data-help-text="This tab shows all downloads linked to this brand. Use the + button to assign a download file. Use Search to filter by name or ID."><i class="fas fa-question"></i></a>
+                            <div class="tab-help-popover" id="help-popover-downloads"></div>
                         </div>
                     </div>
+                    <div class="tab-search-row" id="search-row-downloads">
+                        <input type="text" class="tab-search-input" placeholder="Filter downloads by name, ID..." autocomplete="off">
+                        <button class="clear-search-btn" title="Clear"><i class="fas fa-times"></i></button>
+                    </div>
 
-                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_download_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_download_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
                             <thead>
@@ -3525,13 +3661,18 @@ class Controller
                             <i class="fas fa-bullhorn" style="margin-right: 8px;"></i> Announcements
                         </h4>
                         <div class="action-bar-right">
-                            <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-announcements"><i class="fas fa-search"></i></a>
                             <a href="#modal-add-announcement" data-toggle="modal" data-target="#modal-add-announcement" class="action-circle-btn" title="Add Announcement"><i class="fas fa-plus"></i></a>
-                            <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
+                            <a class="action-circle-btn tab-help-btn" title="Help" data-help-title="Announcements Tab" data-help-text="This tab shows all announcements linked to this brand. Use the + button to assign an announcement. Use Search to filter by title or ID."><i class="fas fa-question"></i></a>
+                            <div class="tab-help-popover" id="help-popover-announcements"></div>
                         </div>
                     </div>
+                    <div class="tab-search-row" id="search-row-announcements">
+                        <input type="text" class="tab-search-input" placeholder="Filter announcements by title, ID..." autocomplete="off">
+                        <button class="clear-search-btn" title="Clear"><i class="fas fa-times"></i></button>
+                    </div>
 
-                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_announcement_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_announcement_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
                             <thead>
@@ -3585,10 +3726,15 @@ class Controller
                             <i class="fas fa-tags" style="margin-right: 8px;"></i> Promotions
                         </h4>
                         <div class="action-bar-right">
-                            <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-promotions"><i class="fas fa-search"></i></a>
                             <a href="#modal-add-promotion" data-toggle="modal" data-target="#modal-add-promotion" class="action-circle-btn" title="Add Promotion"><i class="fas fa-plus"></i></a>
-                            <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
+                            <a class="action-circle-btn tab-help-btn" title="Help" data-help-title="Promotions Tab" data-help-text="This tab shows all promotions linked to this brand. Use the + button to assign a promotion. Use Search to filter by code or name."><i class="fas fa-question"></i></a>
+                            <div class="tab-help-popover" id="help-popover-promotions"></div>
                         </div>
+                    </div>
+                    <div class="tab-search-row" id="search-row-promotions">
+                        <input type="text" class="tab-search-input" placeholder="Filter promotions by code, name..." autocomplete="off">
+                        <button class="clear-search-btn" title="Clear"><i class="fas fa-times"></i></button>
                     </div>
 
                     <!-- Promotions Sub-tabs -->
@@ -3598,7 +3744,7 @@ class Controller
                         <li><a href="#promo-all" role="tab" data-toggle="tab" style="padding: 6px 12px; font-weight: 600;">All</a></li>
                     </ul>
 
-                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_promotion_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_promotion_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <div class="tab-content" style="border: none; padding: 0; box-shadow: none; background: transparent;">';
 
@@ -3801,13 +3947,18 @@ class Controller
                             <i class="fas fa-dollar-sign" style="margin-right: 8px;"></i> Billable Items
                         </h4>
                         <div class="action-bar-right">
-                            <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-billable"><i class="fas fa-search"></i></a>
                             <a href="#modal-add-billable" data-toggle="modal" data-target="#modal-add-billable" class="action-circle-btn" title="Add Billable Item"><i class="fas fa-plus"></i></a>
-                            <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
+                            <a class="action-circle-btn tab-help-btn" title="Help" data-help-title="Billable Items Tab" data-help-text="This tab shows all billable items linked to this brand. Use the + button to assign a billable item. Use Search to filter by description or amount."><i class="fas fa-question"></i></a>
+                            <div class="tab-help-popover" id="help-popover-billable"></div>
                         </div>
                     </div>
+                    <div class="tab-search-row" id="search-row-billable">
+                        <input type="text" class="tab-search-input" placeholder="Filter billable items by description..." autocomplete="off">
+                        <button class="clear-search-btn" title="Clear"><i class="fas fa-times"></i></button>
+                    </div>
 
-                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_billable_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_billable_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
                             <thead>
@@ -3877,13 +4028,18 @@ class Controller
                             <i class="fas fa-envelope" style="margin-right: 8px;"></i> Emails
                         </h4>
                         <div class="action-bar-right">
-                            <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
+                            <a class="action-circle-btn tab-search-toggle" title="Search" data-search-target="search-row-emails"><i class="fas fa-search"></i></a>
                             <a href="#modal-add-email" data-toggle="modal" data-target="#modal-add-email" class="action-circle-btn" title="Add Email"><i class="fas fa-plus"></i></a>
-                            <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
+                            <a class="action-circle-btn tab-help-btn" title="Help" data-help-title="Emails Tab" data-help-text="This tab shows all email messages linked to this brand. Use the + button to assign an email. Use Search to filter by subject or recipient."><i class="fas fa-question"></i></a>
+                            <div class="tab-help-popover" id="help-popover-emails"></div>
                         </div>
                     </div>
+                    <div class="tab-search-row" id="search-row-emails">
+                        <input type="text" class="tab-search-input" placeholder="Filter emails by subject, recipient..." autocomplete="off">
+                        <button class="clear-search-btn" title="Clear"><i class="fas fa-times"></i></button>
+                    </div>
 
-                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_email_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=bulk_unlink_email_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
                             <thead>
@@ -3905,7 +4061,8 @@ class Controller
                 $output .= '<tr>
                     <td class="text-center"><input type="checkbox" name="email_ids[]" value="' . $email->id . '" class="email-item-checkbox"></td>
                     <td>' . $email->id . '</td>
-                    <td><a href="emails.php?action=view&id=' . $email->id . '" target="_blank" style="font-weight: bold; color: #007bff; text-decoration: none;">' . htmlspecialchars($email->subject) . '</a></td>
+                    <!-- <td><a href="emails.php?action=view&id=' . $email->id . '" target="_blank" style="font-weight: bold; color: #007bff; text-decoration: none;">' . htmlspecialchars($email->subject) . '</a></td> -->
+                    <td>' . htmlspecialchars($email->subject) . '</td>
                     <td><a href="clientssummary.php?userid=' . $email->userid . '" target="_blank" style="font-weight: bold; color: #007bff; text-decoration: none;">' . htmlspecialchars($email->firstname . ' ' . $email->lastname) . '</a></td>
                     <td>' . htmlspecialchars($email->to) . '</td>
                     <td>' . htmlspecialchars($email->date) . '</td>
@@ -3936,7 +4093,7 @@ class Controller
         // Strip datatable class from empty tables immediately to prevent DataTable crash
         jQuery("table.datatable").each(function() {
             if (jQuery(this).find("tbody td[colspan]").length > 0) {
-                jQuery(this).removeClass("datatable");
+                jQuery(this).removeClass("datatable").addClass("datatable-placeholder");
             }
         });
 
@@ -3967,6 +4124,9 @@ class Controller
                     });
                 }
             });
+
+            // Restore datatable class to empty tables to bring back WHMCS styling
+            jQuery("table.datatable-placeholder").addClass("datatable").removeClass("datatable-placeholder");
         });
         </script>';
 
@@ -4016,7 +4176,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-user-plus" style="margin-right: 8px;"></i> Assign Client</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=save_client_relation_from_modal">
+                    <form method="post" action="' . $modulelink . '&action=save_client_relation_from_modal">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="redirect" value="edit">
                         
@@ -4078,7 +4238,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-exchange-alt" style="margin-right: 8px;"></i> Migrate Client</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=migrate_client_from_modal">
+                    <form method="post" action="' . $modulelink . '&action=migrate_client_from_modal">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="current_brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="client_id" value="">
                         <input type="hidden" name="redirect" value="edit">
@@ -4115,7 +4275,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-plus" style="margin-right: 8px;"></i> Add Service</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=add_service_relation_from_modal">
+                    <form method="post" action="' . $modulelink . '&action=add_service_relation_from_modal">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="redirect" value="edit">
                         
@@ -4156,7 +4316,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-file-invoice-dollar" style="margin-right: 8px;"></i> Add Invoice</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=save_invoice_relation">
+                    <form method="post" action="' . $modulelink . '&action=save_invoice_relation">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="redirect" value="edit">
                         
@@ -4187,7 +4347,7 @@ class Controller
                         <button type="button" class="close" data-toggle="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-file-signature" style="margin-right: 8px;"></i> Assign Quote</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=save_quote_relation">
+                    <form method="post" action="' . $modulelink . '&action=save_quote_relation">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="redirect" value="edit">
                         
@@ -4218,7 +4378,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-ticket-alt" style="margin-right: 8px;"></i> Add Ticket</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=save_ticket_relation">
+                    <form method="post" action="' . $modulelink . '&action=save_ticket_relation">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <input type="hidden" name="redirect" value="edit">
                         
@@ -4519,6 +4679,104 @@ class Controller
                     this.checked = checked;
                 });
             });
+
+            // =============================================
+            // TAB SEARCH TOGGLE & LIVE FILTER
+            // =============================================
+            $(document).on("click", ".tab-search-toggle", function(e) {
+                e.preventDefault();
+                var targetId = $(this).data("search-target");
+                var $row = $("#" + targetId);
+                var $btn = $(this);
+
+                if ($row.hasClass("open")) {
+                    $row.removeClass("open");
+                    $btn.removeClass("active");
+                    $row.find(".tab-search-input").val("").trigger("input");
+                } else {
+                    // Close any other open search rows
+                    $(".tab-search-row.open").each(function() {
+                        $(this).removeClass("open");
+                        var otherId = $(this).attr("id");
+                        $(".tab-search-toggle[data-search-target=\'" + otherId + "\']").removeClass("active");
+                        $(this).find(".tab-search-input").val("").trigger("input");
+                    });
+                    $row.addClass("open");
+                    $btn.addClass("active");
+                    setTimeout(function() { $row.find(".tab-search-input").focus(); }, 50);
+                }
+            });
+
+            // Clear/close search button - clears filter AND closes the search row
+            $(document).on("click", ".clear-search-btn", function(e) {
+                e.preventDefault();
+                var $row = $(this).closest(".tab-search-row");
+                var rowId = $row.attr("id");
+                // Clear and hide all rows
+                $row.find(".tab-search-input").val("").trigger("input");
+                $row.removeClass("open");
+                // Deactivate the matching search toggle button
+                $(".tab-search-toggle[data-search-target=\'" + rowId + "\']").removeClass("active");
+            });
+
+            // Live filter: filter table rows based on search input
+            $(document).on("input", ".tab-search-input", function() {
+                var query = $(this).val().toLowerCase().trim();
+                // Find the nearest table inside the same tab-pane
+                var $tabPane = $(this).closest(".tab-pane");
+                var $rows = $tabPane.find("table tbody tr");
+
+                $rows.each(function() {
+                    var text = $(this).text().toLowerCase();
+                    if (query === "" || text.indexOf(query) !== -1) {
+                        $(this).show();
+                    } else {
+                        $(this).hide();
+                    }
+                });
+
+                // Show/hide no-results message
+                var $tbody = $tabPane.find("table tbody");
+                var visibleRows = $tbody.find("tr:visible").length;
+                $tbody.find(".no-filter-results").remove();
+                if (visibleRows === 0 && query !== "") {
+                    $tbody.append(\'<tr class="no-filter-results"><td colspan="20" class="text-center" style="padding: 20px; color: #999; font-style: italic;">No results matching &ldquo;\' + $("<div>").text(query).html() + \'&rdquo;</td></tr>\');
+                }
+            });
+
+            // =============================================
+            // HELP POPOVER
+            // =============================================
+            $(document).on("click", ".tab-help-btn", function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var $btn = $(this);
+                var $bar = $btn.closest(".action-bar-right");
+                var $popover = $bar.find(".tab-help-popover");
+                var helpTitle = $btn.data("help-title") || "Help";
+                var helpText  = $btn.data("help-text") || "";
+
+                if ($popover.hasClass("open")) {
+                    $popover.removeClass("open");
+                    $btn.removeClass("active");
+                } else {
+                    // Close any other open popovers
+                    $(".tab-help-popover.open").removeClass("open");
+                    $(".tab-help-btn.active").removeClass("active");
+                    // Set content
+                    $popover.html("<h6><i class=\'fas fa-info-circle\' style=\'margin-right:6px;color:#007bff\'></i>" + helpTitle + "</h6><p style=\'margin:0;\'>" + helpText + "</p>");
+                    $popover.addClass("open");
+                    $btn.addClass("active");
+                }
+            });
+
+            // Close help popover when clicking outside
+            $(document).on("click", function(e) {
+                if (!$(e.target).closest(".action-bar-right").length) {
+                    $(".tab-help-popover.open").removeClass("open");
+                    $(".tab-help-btn.active").removeClass("active");
+                }
+            });
         });
         </script>';
 
@@ -4531,7 +4789,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold;"><i class="fas fa-plus"></i> Add Article</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=save_kb_relation_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=save_kb_relation_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <div class="modal-body">
                             <div class="form-group">
@@ -4578,7 +4836,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold;"><i class="fas fa-plus"></i> Add Download</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=save_download_relation_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=save_download_relation_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <div class="modal-body">
                             <div class="form-group">
@@ -4626,7 +4884,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold;"><i class="fas fa-plus"></i> Add Announcement</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=save_announcement_relation_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=save_announcement_relation_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <div class="modal-body">
                             <div class="form-group">
@@ -4673,7 +4931,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold;"><i class="fas fa-plus"></i> Add Promotion</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=save_promotion_relation_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=save_promotion_relation_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <div class="modal-body">
                             <div class="form-group">
@@ -4734,7 +4992,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold;"><i class="fas fa-plus"></i> Add Billable Item</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=save_billable_relation_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=save_billable_relation_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <div class="modal-body">
                             <div class="form-group">
@@ -4794,7 +5052,7 @@ class Controller
                         <button type="button" class="close" data-dismiss="modal">&times;</button>
                         <h4 class="modal-title" style="font-weight: bold;"><i class="fas fa-plus"></i> Add Email</h4>
                     </div>
-                    <form method="post" action="' . $modulelink . '&action=save_email_relation_from_edit">
+                    <form method="post" action="' . $modulelink . '&action=save_email_relation_from_edit">' . generate_token() . '' . generate_token() . '
                         <input type="hidden" name="brand_id" value="' . $brand->id . '">
                         <div class="modal-body">
                             <div class="form-group">
@@ -4827,7 +5085,20 @@ class Controller
 
         <script>
         $(document).ready(function() {
-        // Keep active tab state on form submit
+            // Fix action-circle-btn modals not opening in some themes due to anchor click overrides
+            $(document).on(\'click\', \'.action-circle-btn\', function(e) {
+                var target = $(this).attr(\'data-target\') || $(this).attr(\'href\');
+                if (target && target.indexOf(\'#\') === 0 && target.indexOf(\'#modal-\') === 0) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    var $modal = $(target);
+                    if ($modal.length && typeof $modal.modal === \'function\') {
+                        $modal.modal(\'show\');
+                    }
+                }
+            });
+
+            // Keep active tab state on form submit
             jQuery(\'a[data-toggle="tab"]\').on(\'shown.bs.tab\', function (e) {
                 var target = jQuery(e.target).attr("href");
                  if (target && target.indexOf("#set-") === 0) {
@@ -4856,7 +5127,8 @@ class Controller
             });
 
             // Services Pricing - search table local filtering
-            jQuery(document).on("click", ".pricing-search-btn", function() {
+            // pricing-search-btn is now replaced by tab-search-toggle - no action needed here
+            jQuery(document).on("click", ".pricing-search-btn-legacy", function() {
                 jQuery(this).closest(".tab-pane").find(".pricing-search-wrapper").slideToggle(200);
             });
             jQuery(document).on("keyup", ".search-pricing-table", function() {
@@ -5106,6 +5378,10 @@ class Controller
                             { key: "5year", label: "5 Years Register", priceKey: "register5", setupKey: "transfer5", renewKey: "renew5", isDomain: true },
                             { key: "10year", label: "10 Years Register", priceKey: "register10", setupKey: "transfer10", renewKey: "renew10", isDomain: true }
                         ];
+                    } else if (data.paymenttype === "bundle") {
+                        cycleList = [
+                            { key: "bundle", label: "Display Price", priceKey: "displayprice", isBundle: true }
+                        ];
                     } else {
                         // Fallback generic pricing
                         cycleList = [
@@ -5167,6 +5443,17 @@ class Controller
                                 "          <input type=\"text\" class=\"form-control\" name=\"pricing[" + curr.id + "][" + cyc.renewKey + "]\" value=\"" + overRenew + "\" data-default=\"" + baseRenew + "\">" +
                                 "        </div>" +
                                 "        <small class=\"text-muted\">Base: " + curr.prefix + baseRenew + "</small>" +
+                                "      </div>"
+                            );
+                        } else if (cyc.isBundle) {
+                            row.append(
+                                "      <div class=\"col-sm-12\">" +
+                                "        <label style=\"font-weight: 500; font-size: 0.9em;\">Display Price</label>" +
+                                "        <div class=\"input-group input-group-sm\">" +
+                                "          <span class=\"input-group-addon\">" + curr.prefix + "</span>" +
+                                "          <input type=\"text\" class=\"form-control\" name=\"pricing[" + curr.id + "][" + cyc.priceKey + "]\" value=\"" + overPrice + "\" data-default=\"" + basePrice + "\">" +
+                                "        </div>" +
+                                "        <small class=\"text-muted\">Base: " + curr.prefix + basePrice + "</small>" +
                                 "      </div>"
                             );
                         } else {
@@ -5498,7 +5785,7 @@ class Controller
         $title = $brand ? 'Edit Brand: ' . htmlspecialchars($brand->brand_name) : 'Add New Brand';
 
         $output = '<h2>' . $title . '</h2>';
-        $output .= '<form method="post" action="' . $modulelink . '&action=save" enctype="multipart/form-data" novalidate>';
+        $output .= '<form method="post" action="' . $modulelink . '&action=save" enctype="multipart/form-data" novalidate>' . generate_token() . '' . generate_token() . '';
         if ($brand) {
             $output .= '<input type="hidden" name="id" value="' . $brand->id . '">';
         }
@@ -5660,1394 +5947,7 @@ class Controller
         return $languages;
     }
 
-    /**
-     * Brand-wise relations dashboard showing assigned Clients, Services, and Invoices
-     */
-    public function relations($vars)
-    {
-        $id = (int) $_REQUEST['id'];
-        $modulelink = $vars['modulelink'];
-
-        $brand = Capsule::table('mod_multibrand_brands')->find($id);
-        if (!$brand) {
-            return '<div class="alert alert-danger">Brand not found.</div>' . $this->index($vars);
-        }
-
-        // Get associated client IDs
-        $clientIds = Capsule::table('mod_multibrand_client_brands')
-            ->where('brand_id', $id)
-            ->pluck('client_id')
-            ->toArray();
-
-        // Fetch all WHMCS clients for the Assign Client modal dropdown
-        $allClients = [];
-        try {
-            $allClients = Capsule::table('tblclients')->orderBy('firstname', 'asc')->get();
-        } catch (\Exception $e) {}
-
-        // Fetch all WHMCS client groups for the Assign Client modal dropdown
-        $clientGroups = [];
-        try {
-            $clientGroups = Capsule::table('tblclientgroups')->orderBy('groupname', 'asc')->get();
-        } catch (\Exception $e) {}
-
-        // Fetch all brands for the Migrate Client modal dropdown
-        $brandsList = [];
-        try {
-            $brandsList = Capsule::table('mod_multibrand_brands')->orderBy('brand_name', 'asc')->get();
-        } catch (\Exception $e) {}
-
-        // 1. Fetch Clients
-        $clients = [];
-        if (!empty($clientIds)) {
-            $clients = Capsule::table('tblclients')
-                ->whereIn('id', $clientIds)
-                ->get();
-        }
-
-        // 2. Fetch Services
-        $services = [];
-        try {
-            $services = Capsule::table('tblhosting')
-                ->join('tblproducts', 'tblhosting.packageid', '=', 'tblproducts.id')
-                ->join('tblclients', 'tblhosting.userid', '=', 'tblclients.id')
-                ->join('mod_multibrand_service_brands', 'tblhosting.id', '=', 'mod_multibrand_service_brands.service_id')
-                ->where('mod_multibrand_service_brands.brand_id', $id)
-                ->select(
-                    'tblhosting.*', 
-                    'tblproducts.name as product_name', 
-                    'tblclients.firstname', 
-                    'tblclients.lastname'
-                )
-                ->get();
-        } catch (\Exception $e) {}
-
-        // Fetch brand-specific unassigned/assigned services, addons, and domains
-        // Dynamically create addon brands table if missing
-        try {
-            if (!Capsule::schema()->hasTable('mod_multibrand_addon_brands')) {
-                Capsule::schema()->create('mod_multibrand_addon_brands', function ($table) {
-                    $table->increments('id');
-                    $table->integer('addon_id')->unique();
-                    $table->integer('brand_id');
-                    $table->timestamps();
-                });
-            }
-        } catch (\Exception $e) {}
-
-        // Dynamically create domain brands table if missing
-        try {
-            if (!Capsule::schema()->hasTable('mod_multibrand_domain_brands')) {
-                Capsule::schema()->create('mod_multibrand_domain_brands', function ($table) {
-                    $table->increments('id');
-                    $table->integer('domain_id')->unique();
-                    $table->integer('brand_id');
-                    $table->timestamps();
-                });
-            }
-        } catch (\Exception $e) {}
-
-        // Fetch explicitly assigned addons
-        $addons = [];
-        try {
-            $addons = Capsule::table('tblhostingaddons')
-                ->join('tblhosting', 'tblhostingaddons.hostingid', '=', 'tblhosting.id')
-                ->join('tblclients', 'tblhosting.userid', '=', 'tblclients.id')
-                ->leftJoin('tbladdons', 'tblhostingaddons.addonid', '=', 'tbladdons.id')
-                ->join('mod_multibrand_addon_brands', 'tblhostingaddons.id', '=', 'mod_multibrand_addon_brands.addon_id')
-                ->where('mod_multibrand_addon_brands.brand_id', $id)
-                ->select(
-                    'tblhostingaddons.*',
-                    'tbladdons.name as addon_name',
-                    'tblhosting.domain as service_domain',
-                    'tblclients.firstname',
-                    'tblclients.lastname',
-                    'tblclients.id as userid'
-                )
-                ->get();
-        } catch (\Exception $e) {}
-
-        // Fetch explicitly assigned domains
-        $domains = [];
-        try {
-            $domains = Capsule::table('tbldomains')
-                ->join('tblclients', 'tbldomains.userid', '=', 'tblclients.id')
-                ->join('mod_multibrand_domain_brands', 'tbldomains.id', '=', 'mod_multibrand_domain_brands.domain_id')
-                ->where('mod_multibrand_domain_brands.brand_id', $id)
-                ->select(
-                    'tbldomains.*',
-                    'tblclients.firstname',
-                    'tblclients.lastname',
-                    'tblclients.id as userid'
-                )
-                ->get();
-        } catch (\Exception $e) {}
-
-        // 3. Fetch Invoices
-        $invoices = [];
-        try {
-            $invoices = Capsule::table('tblinvoices')
-                ->join('tblclients', 'tblinvoices.userid', '=', 'tblclients.id')
-                ->leftJoin('tblcurrencies', 'tblclients.currency', '=', 'tblcurrencies.id')
-                ->join('mod_multibrand_invoice_brands', 'tblinvoices.id', '=', 'mod_multibrand_invoice_brands.invoice_id')
-                ->leftJoin('mod_multibrand_brands', 'mod_multibrand_invoice_brands.brand_id', '=', 'mod_multibrand_brands.id')
-                ->where('mod_multibrand_invoice_brands.brand_id', $id)
-                ->select(
-                    'tblinvoices.*', 
-                    'tblclients.firstname', 
-                    'tblclients.lastname',
-                    'tblcurrencies.code as currency_code',
-                    'mod_multibrand_invoice_brands.brand_id',
-                    'mod_multibrand_brands.brand_name'
-                )
-                ->get();
-        } catch (\Exception $e) {}
-
-        // Counts
-        $clientsCount = count($clients);
-        $servicesCount = count($services);
-        $invoicesCount = count($invoices);
-
-        // Header CSS & Tabs matching the screenshot
-        $output = '
-        <style>
-            .relations-header-container {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                margin-bottom: 25px;
-                border-bottom: 2px solid #ef4444;
-                padding-bottom: 10px;
-            }
-            .relations-title {
-                color: #ef4444;
-                margin: 0;
-                font-weight: bold;
-                text-transform: uppercase;
-                display: flex;
-                align-items: center;
-                font-size: 1.6em;
-            }
-            .relations-tabs {
-                border-bottom: 1px solid #ddd;
-                margin-bottom: 25px;
-                display: flex;
-                list-style: none;
-                padding: 0;
-            }
-            .relations-tabs li {
-                margin-bottom: -1px;
-            }
-            .relations-tabs li a {
-                display: block;
-                padding: 12px 24px;
-                font-size: 1.1em;
-                color: #555;
-                text-decoration: none;
-                font-weight: 600;
-                border-bottom: 3px solid transparent;
-                transition: all 0.2s ease;
-            }
-            .relations-tabs li a:hover {
-                color: #333;
-                background: #f5f5f5;
-                border-radius: 4px 4px 0 0;
-            }
-            .relations-tabs li.active a {
-                color: #ef4444;
-                border-bottom-color: #ef4444;
-                font-weight: bold;
-            }
-            .action-bar-right {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }
-            .action-circle-btn {
-                width: 32px;
-                height: 32px;
-                border-radius: 50%;
-                border: 1px solid #ccc;
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                color: #555;
-                background: #fff;
-                cursor: pointer;
-                transition: all 0.15s ease;
-                text-decoration: none;
-            }
-            .action-circle-btn:hover {
-                background: #f0f0f0;
-                color: #000;
-                border-color: #999;
-                text-decoration: none;
-            }
-        </style>
- 
-        <div class="relations-header-container">
-            <h3 class="relations-title">
-                <i class="fas fa-exchange-alt" style="margin-right: 12px;"></i> Relations
-            </h3>
-            <div>
-                <a href="' . $modulelink . '" class="btn btn-default"><i class="fas fa-arrow-left"></i> Back to Brands</a>
-            </div>
-        </div>
- 
-        <ul class="relations-tabs" role="tablist">
-            <li class="active"><a href="#tab-clients" role="tab" data-toggle="tab">Clients (' . $clientsCount . ')</a></li>
-            <li><a href="#tab-services" role="tab" data-toggle="tab">Services (' . $servicesCount . ')</a></li>
-            <li><a href="#tab-invoices" role="tab" data-toggle="tab">Invoices (' . $invoicesCount . ')</a></li>
-        </ul>
- 
-        <div class="tab-content">
-            <!-- CLIENTS TAB -->
-            <div class="tab-pane active" id="tab-clients">
-                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px;">
-                    <h4 style="margin: 0; font-weight: bold; color: #ef4444; text-transform: uppercase; display: flex; align-items: center;">
-                        <i class="fas fa-users" style="margin-right: 8px;"></i> Clients
-                    </h4>
-                    <div class="action-bar-right">
-                        <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
-                        <a href="#modal-assign-client" data-toggle="modal" data-target="#modal-assign-client" class="action-circle-btn" title="Add Relation"><i class="fas fa-plus"></i></a>
-                        <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
-                    </div>
-                </div>
- 
-                <form method="post" action="' . $modulelink . '&action=bulk_unlink_client">
-                    <input type="hidden" name="brand_id" value="' . $id . '">
-                    <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
-                        <thead>
-                            <tr>
-                                <th width="30" class="text-center"><input type="checkbox" id="client-select-all"></th>
-                                <th width="60">#ID</th>
-                                <th>First Name</th>
-                                <th>Last Name</th>
-                                <th>Company</th>
-                                <th>Created At</th>
-                                <th width="120" class="text-center">Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>';
- 
-        if (count($clients) > 0) {
-            foreach ($clients as $client) {
-                $createdAt = isset($client->datecreated) ? date('Y-m-d H:i:s', strtotime($client->datecreated)) : '-';
-                $company = $client->companyname ?: '-';
-                
-                $firstNameLink = '<a href="clientssummary.php?userid=' . $client->id . '" style="font-weight: 600; color: #ef4444; text-decoration: none;">' . htmlspecialchars($client->firstname) . '</a>';
-                $lastNameLink = '<a href="clientssummary.php?userid=' . $client->id . '" style="font-weight: 600; color: #ef4444; text-decoration: none;">' . htmlspecialchars($client->lastname) . '</a>';
-                $companyLink = $client->companyname ? '<a href="clientssummary.php?userid=' . $client->id . '" style="font-weight: 600; color: #ef4444; text-decoration: none;">' . htmlspecialchars($client->companyname) . '</a>' : '-';
- 
-                $output .= '<tr>
-                    <td class="text-center"><input type="checkbox" name="client_ids[]" value="' . $client->id . '"></td>
-                    <td>' . $client->id . '</td>
-                    <td>' . $firstNameLink . '</td>
-                    <td>' . $lastNameLink . '</td>
-                    <td>' . $companyLink . '</td>
-                    <td>' . htmlspecialchars($createdAt) . '</td>
-                    <td class="text-center">
-                        <a href="#" class="btn btn-sm btn-primary btn-migrate-client" data-client-id="' . $client->id . '" data-client-name="' . htmlspecialchars($client->firstname . ' ' . $client->lastname) . '" style="margin-right: 5px; background-color: #337ab7; border-color: #2e6da4;" title="Migrate Client"><i class="fas fa-exchange-alt"></i></a>
-                        <a href="' . $modulelink . '&action=unlink_client&brand_id=' . $id . '&client_id=' . $client->id . '" class="btn btn-sm btn-danger" onclick="return confirm(\'Are you sure you want to unlink this client from this brand?\')" title="Unlink Brand" style="background-color: #d9534f; border-color: #d43f3a;"><i class="fas fa-trash-alt"></i></a>
-                    </td>
-                </tr>';
-            }
-        } else {
-            $output .= '<tr><td colspan="7" class="text-center">No clients assigned to this brand. Click the "+" button in the top right to assign one.</td></tr>';
-        }
- 
-        $output .= '
-                        </tbody>
-                    </table>
-                    
-                    <div style="margin-top: 15px; display: flex; align-items: center; gap: 8px;">
-                        <span>With Selected:</span>
-                        <button type="submit" class="btn btn-danger btn-sm" style="background-color: #d9534f; border-color: #d43f3a;" onclick="return confirm(\'Are you sure you want to delete selected brand relations?\')">Delete</button>
-                    </div>
-                </form>
-            </div>
- 
-            <!-- SERVICES TAB -->
-            <div class="tab-pane" id="tab-services">
-                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px;">
-                    <h4 style="margin: 0; font-weight: bold; color: #ef4444; text-transform: uppercase; display: flex; align-items: center;">
-                        <i class="fas fa-cubes" style="margin-right: 8px;"></i> Services
-                    </h4>
-                </div>
-
-                <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
-                    <thead>
-                        <tr>
-                            <th width="60">#ID</th>
-                            <th>Client</th>
-                            <th>Product/Service</th>
-                            <th>Domain</th>
-                            <th>Amount</th>
-                            <th>Billing Cycle</th>
-                            <th>Next Due Date</th>
-                            <th width="120" class="text-center">Status</th>
-                        </tr>
-                    </thead>
-                    <tbody>';
-
-        if (count($services) > 0) {
-            foreach ($services as $service) {
-                $statusColor = '#777';
-                if (strtolower($service->domainstatus) == 'active') {
-                    $statusColor = '#5cb85c';
-                } elseif (strtolower($service->domainstatus) == 'suspended') {
-                    $statusColor = '#f0ad4e';
-                } elseif (strtolower($service->domainstatus) == 'terminated') {
-                    $statusColor = '#d9534f';
-                }
-                
-                $statusBadge = '<span class="label" style="background-color: ' . $statusColor . '; color: #fff; padding: 4px 8px; border-radius: 3px; font-weight: bold; font-size: 0.85em; text-transform: uppercase;">' . htmlspecialchars($service->domainstatus) . '</span>';
-                $nextDue = ($service->nextduedate && $service->nextduedate != '0000-00-00') ? $service->nextduedate : '-';
-
-                $output .= '<tr>
-                    <td>' . $service->id . '</td>
-                    <td>' . htmlspecialchars($service->firstname . ' ' . $service->lastname) . '</td>
-                    <td>' . htmlspecialchars($service->product_name) . '</td>
-                    <td>' . ($service->domain ? htmlspecialchars($service->domain) : '-') . '</td>
-                    <td>' . htmlspecialchars($service->amount) . '</td>
-                    <td>' . htmlspecialchars($service->billingcycle) . '</td>
-                    <td>' . htmlspecialchars($nextDue) . '</td>
-                    <td class="text-center">' . $statusBadge . '</td>
-                </tr>';
-            }
-        } else {
-            $output .= '<tr><td colspan="8" class="text-center">No services found for clients under this brand.</td></tr>';
-        }
-
-        $output .= '
-                    </tbody>
-                </table>
-            </div>
-
-            <!-- INVOICES TAB -->
-            <div class="tab-pane" id="tab-invoices">
-                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px;">
-                    <h4 style="margin: 0; font-weight: bold; color: #ef4444; text-transform: uppercase; display: flex; align-items: center; font-size: 1.1em;">
-                        <i class="fas fa-file-invoice-dollar" style="margin-right: 8px;"></i> Invoices
-                    </h4>
-                    <div class="action-bar-right">
-                        <a class="action-circle-btn" title="Search"><i class="fas fa-search"></i></a>
-                        <a href="#modal-add-invoice" data-toggle="modal" data-target="#modal-add-invoice" class="action-circle-btn" title="Add Invoice"><i class="fas fa-plus"></i></a>
-                        <a class="action-circle-btn" title="Help"><i class="fas fa-question"></i></a>
-                    </div>
-                </div>
-
-                <form method="post" action="' . $modulelink . '&action=bulk_unlink_invoices">
-                    <input type="hidden" name="brand_id" value="' . $id . '">
-                    <input type="hidden" name="redirect" value="relations">
-                    <table class="datatable" width="100%" border="0" cellspacing="1" cellpadding="3">
-                        <thead>
-                            <tr>
-                                <th width="30" class="text-center"><input type="checkbox" id="invoice-select-all"></th>
-                                <th width="60">#ID</th>
-                                <th>Invoice Number</th>
-                                <th>Client</th>
-                                <th>Invoice Date</th>
-                                <th>Due Date</th>
-                                <th>Total</th>
-                                <th>Currency</th>
-                                <th>Payment Method</th>
-                                <th width="100" class="text-center">Status</th>
-                                <th width="100" class="text-center">Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody>';
-
-        if (count($invoices) > 0) {
-            foreach ($invoices as $invoice) {
-                $statusColor = '#777';
-                if (strtolower($invoice->status) == 'paid') {
-                    $statusColor = '#5cb85c';
-                } elseif (strtolower($invoice->status) == 'unpaid') {
-                    $statusColor = '#f0ad4e';
-                } elseif (strtolower($invoice->status) == 'cancelled' || strtolower($invoice->status) == 'refunded') {
-                    $statusColor = '#d9534f';
-                }
-                
-                $statusBadge = '<span class="label" style="background-color: ' . $statusColor . '; color: #fff; padding: 4px 8px; border-radius: 3px; font-weight: bold; font-size: 0.85em; text-transform: uppercase;">' . htmlspecialchars($invoice->status) . '</span>';
-                $invDate = $invoice->date ? $invoice->date : '-';
-                $dueDate = $invoice->duedate ? $invoice->duedate : '-';
-                
-                $numDisplay = $invoice->invoicenum ?: $invoice->id;
-                $invoiceLink = '<a href="invoices.php?action=edit&id=' . $invoice->id . '" style="font-weight: 600; color: #ef4444; text-decoration: none;">' . htmlspecialchars($numDisplay) . '</a>';
-                $clientLink = '<a href="clientssummary.php?userid=' . $invoice->userid . '" style="font-weight: 600; color: #ef4444; text-decoration: none;">' . htmlspecialchars($invoice->firstname . ' ' . $invoice->lastname) . '</a>';
-                $currencyDisplay = isset($invoice->currency_code) && $invoice->currency_code ? htmlspecialchars($invoice->currency_code) : '-';
-
-                $output .= '<tr>
-                    <td class="text-center"><input type="checkbox" name="invoice_ids[]" value="' . $invoice->id . '" class="invoice-item-checkbox"></td>
-                    <td><a href="invoices.php?action=edit&id=' . $invoice->id . '" style="font-weight: 600; color: #ef4444; text-decoration: none;">' . $invoice->id . '</a></td>
-                    <td>' . $invoiceLink . '</td>
-                    <td>' . $clientLink . '</td>
-                    <td>' . htmlspecialchars($invDate) . '</td>
-                    <td>' . htmlspecialchars($dueDate) . '</td>
-                    <td>' . htmlspecialchars($invoice->total) . '</td>
-                    <td>' . $currencyDisplay . '</td>
-                    <td>' . htmlspecialchars($invoice->paymentmethod) . '</td>
-                    <td class="text-center">' . $statusBadge . '</td>
-                    <td class="text-center">
-                        <a href="invoices.php?action=edit&id=' . $invoice->id . '" class="btn btn-sm btn-primary" style="margin-right: 5px; background-color: #337ab7; border-color: #2e6da4;" title="Edit Invoice"><i class="fas fa-pencil-alt"></i></a>
-                        <a href="' . $modulelink . '&action=unlink_invoice_relation&brand_id=' . $id . '&invoice_id=' . $invoice->id . '&redirect=relations" class="btn btn-sm btn-danger" onclick="return confirm(\'Are you sure you want to unlink this invoice from this brand?\')" title="Unlink Brand" style="background-color: #d9534f; border-color: #d43f3a;"><i class="fas fa-trash-alt"></i></a>
-                    </td>
-                </tr>';
-            }
-        } else {
-            $output .= '<tr><td colspan="11" class="text-center">No invoices assigned to this brand. Click the "+" button in the top right to assign one.</td></tr>';
-        }
-
-        $output .= '
-                        </tbody>
-                    </table>
-                    
-                    <div style="margin-top: 15px; display: flex; align-items: center; gap: 8px;">
-                        <span>With Selected:</span>
-                        <button type="submit" class="btn btn-danger btn-sm" style="background-color: #d9534f; border-color: #d43f3a;" onclick="return confirm(\'Are you sure you want to delete selected brand relations?\')">Delete</button>
-                    </div>
-                </form>
-            </div>
-        ';
-        // Options for Assign Client Modal
-        $clientOptions = '';
-        $availableClientCount = 0;
-        if (count($allClients) > 0) {
-            foreach ($allClients as $c) {
-                if (in_array($c->id, $clientIds)) {
-                    continue; // Skip already assigned clients
-                }
-                $comp = $c->companyname ? ' (' . $c->companyname . ')' : '';
-                $clientOptions .= '<option value="' . $c->id . '">#' . $c->id . ' ' . htmlspecialchars($c->firstname . ' ' . $c->lastname) . $comp . '</option>';
-                $availableClientCount++;
-            }
-        }
-        if ($availableClientCount == 0) {
-            $clientOptions = '<option value="0" disabled>No clients available</option>';
-        }
-
-        $groupOptions = '';
-        if (count($clientGroups) > 0) {
-            foreach ($clientGroups as $g) {
-                $groupOptions .= '<option value="' . $g->id . '">' . htmlspecialchars($g->groupname) . '</option>';
-            }
-        } else {
-            $groupOptions .= '<option value="0" disabled>No client groups available</option>';
-        }
-
-        $brandOptions = '';
-        if (count($brandsList) > 0) {
-            foreach ($brandsList as $b) {
-                if ($b->id != $id) {
-                    $brandOptions .= '<option value="' . $b->id . '">#' . $b->id . ' ' . htmlspecialchars($b->brand_name) . ' (' . htmlspecialchars($b->domain) . ')</option>';
-                }
-            }
-        } else {
-            $brandOptions .= '<option value="0" disabled>No other brands available</option>';
-        }
-
-        $output .= '
-        <!-- Assign Client Modal -->
-        <div id="modal-assign-client" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-user-plus" style="margin-right: 8px;"></i> Assign Client</h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=save_client_relation_from_modal">
-                        <input type="hidden" name="brand_id" value="' . $id . '">
-                        <input type="hidden" name="redirect" value="relations">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <div class="form-group" style="margin-bottom: 20px;">
-                                <label style="font-weight: bold; color: #555; display: block; margin-bottom: 8px; font-size: 0.95em;">Type</label>
-                                <select name="type" class="form-control" style="width: 100%; border-radius: 4px; padding: 8px; font-weight: 500; height: auto;">
-                                    <option value="single">Single Client</option>
-                                    <option value="group">Group of Clients</option>
-                                    <option value="all">All Clients</option>
-                                </select>
-                                <small class="text-muted" style="display: block; margin-top: 5px; font-size: 0.82em; color: #777;">Choose the preferred type from the dropdown menu. You can assign one client, a group of clients or all of them.</small>
-                            </div>
-
-                            <div class="form-group" id="client-select-container" style="margin-bottom: 20px;">
-                                <label style="font-weight: bold; color: #555; display: block; margin-bottom: 8px; font-size: 0.95em;">Client</label>
-                                <select name="client_id" class="form-control select2-ajax-clients" style="width: 100%; border-radius: 4px; padding: 8px; height: auto;">
-                                </select>
-                                <small class="text-muted" style="display: block; margin-top: 5px; font-size: 0.82em; color: #777;">Select a client that you would like to assign to the current brand.</small>
-                            </div>
-
-                            <div class="form-group" id="group-select-container" style="margin-bottom: 20px; display: none;">
-                                <label style="font-weight: bold; color: #555; display: block; margin-bottom: 8px; font-size: 0.95em;">Client Group</label>
-                                <select name="group_id" class="form-control" style="width: 100%; border-radius: 4px; padding: 8px; height: auto;">
-                                    ' . $groupOptions . '
-                                </select>
-                                <small class="text-muted" style="display: block; margin-top: 5px; font-size: 0.82em; color: #777;">Select a client group whose members you would like to assign to the current brand.</small>
-                            </div>
-
-                            <div class="form-group" style="margin-bottom: 10px;">
-                                <div style="display: flex; align-items: flex-start; gap: 15px;">
-                                    <div style="width: 120px; font-weight: bold; color: #555; font-size: 0.95em; padding-top: 4px;">Add All Items</div>
-                                    <div style="display: flex; flex-direction: column; gap: 4px;">
-                                        <label class="mb-switch" style="margin-bottom: 0;">
-                                            <input type="checkbox" name="add_all_items" value="1">
-                                            <span class="mb-slider"></span>
-                                        </label>
-                                        <span style="font-size: 0.82em; color: #777; line-height: 1.4;">If enabled, information such as services, invoices, quotes, tickets etc. will be assigned along with a particular client or group of clients.</span>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; padding: 6px 16px; font-weight: 600; border-radius: 4px;">Save</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        $output .= '
-        <!-- Migrate Client Modal -->
-        <div id="modal-migrate-client" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-exchange-alt" style="margin-right: 8px;"></i> Migrate Client</h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=migrate_client_from_modal">
-                        <input type="hidden" name="current_brand_id" value="' . $id . '">
-                        <input type="hidden" name="client_id" value="">
-                        <input type="hidden" name="redirect" value="relations">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <p style="font-size: 1.05em; color: #444; margin-bottom: 20px; font-weight: 500;">
-                                Migrating client: <span class="client-name-display" style="font-weight: bold; color: #ef4444;">-</span>
-                            </p>
-                            
-                            <div class="form-group" style="margin-bottom: 15px;">
-                                <label style="font-weight: bold; color: #555; display: block; margin-bottom: 8px; font-size: 0.95em;">Target Brand</label>
-                                <select name="target_brand_id" class="form-control" style="width: 100%; border-radius: 4px; padding: 8px; font-weight: 500; height: auto;">
-                                    ' . $brandOptions . '
-                                </select>
-                                <small class="text-muted" style="display: block; margin-top: 5px; font-size: 0.82em; color: #777;">Select the brand which you would like to migrate the selected client to.</small>
-                            </div>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; padding: 6px 16px; font-weight: 600; border-radius: 4px;">Save</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        $output .= '
-        <!-- Add Invoice Modal -->
-        <div id="modal-add-invoice" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-file-invoice-dollar" style="margin-right: 8px;"></i> Add Invoice</h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=save_invoice_relation">
-                        <input type="hidden" name="brand_id" value="' . $id . '">
-                        <input type="hidden" name="redirect" value="relations">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <div class="form-group" style="margin-bottom: 20px;">
-                                <label style="font-weight: bold; color: #555; display: block; margin-bottom: 8px; font-size: 0.95em;">Invoice</label>
-                                <select name="invoice_id" class="form-control select2-ajax-unassigned-invoices" style="width: 100%; border-radius: 4px; padding: 8px; height: auto;">
-                                </select>
-                                <small class="text-muted" style="display: block; margin-top: 5px; font-size: 0.82em; color: #777;">Select an invoice that you would like to assign to the current brand.</small>
-                            </div>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; padding: 6px 16px; font-weight: 600; border-radius: 4px;">Save</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        $output .= '
-        <script>
-        // Strip datatable class from empty tables immediately to prevent DataTable crash
-        jQuery("table.datatable").each(function() {
-            if (jQuery(this).find("tbody td[colspan]").length > 0) {
-                jQuery(this).removeClass("datatable");
-            }
-        });
-
-        jQuery(document).ready(function() {
-            // Assign Client Type toggle
-            jQuery(document).on("change", "select[name=\"type\"]", function() {
-                var val = jQuery(this).val();
-                if (val === "single") {
-                    jQuery("#group-select-container").hide();
-                    jQuery("#client-select-container").show();
-                } else if (val === "group") {
-                    jQuery("#client-select-container").hide();
-                    jQuery("#group-select-container").show();
-                } else {
-                    jQuery("#client-select-container").hide();
-                    jQuery("#group-select-container").hide();
-                }
-            });
-
-            // Select All Checkboxes toggle for clients
-            jQuery(document).on("click", "#client-select-all", function() {
-                var checked = this.checked;
-                jQuery("input[name=\"client_ids[]\"]").each(function() {
-                    this.checked = checked;
-                });
-            });
-
-            // Populate Migrate Modal details on click
-            jQuery(document).on("click", ".btn-migrate-client", function(e) {
-                e.preventDefault();
-                var clientId = jQuery(this).data("client-id");
-                var clientName = jQuery(this).data("client-name");
-                jQuery("#modal-migrate-client input[name=\"client_id\"]").val(clientId);
-                jQuery("#modal-migrate-client .client-name-display").text(clientName);
-                jQuery("#modal-migrate-client").modal("show");
-            });
-
-            // Initialize Select2 with AJAX for clients in the Assign modal
-            var initSelect2 = function() {
-                var selectEl = jQuery(".select2-ajax-clients");
-                if (selectEl.length && jQuery.fn.select2) {
-                    if (selectEl.hasClass("select2-hidden-accessible")) {
-                        selectEl.select2("destroy");
-                    }
-                    selectEl.select2({
-                        placeholder: "Search for a client by ID, Name, Email, or Company...",
-                        minimumInputLength: 0,
-                        width: "100%",
-                        dropdownParent: jQuery("#modal-assign-client"),
-                        ajax: {
-                            url: "' . $modulelink . '&action=search_clients&brand_id=' . $id . '",
-                            dataType: "json",
-                            delay: 250,
-                            data: function (params) {
-                                return {
-                                    q: params.term // search query
-                                };
-                            },
-                            processResults: function (data) {
-                                return {
-                                    results: data.results
-                                };
-                            },
-                            cache: true
-                        }
-                    });
-                }
-            };
-
-            // Run on shown.bs.modal to ensure correct width
-            jQuery("#modal-assign-client").on("shown.bs.modal", function() {
-                initSelect2();
-            });
-
-            // Datatable initialization
-            jQuery("#mb-relations-box table.datatable").each(function() {
-                if (!jQuery.fn.DataTable.isDataTable(this)) {
-                    jQuery(this).DataTable({
-                        "dom": \'<"row"<"col-sm-6"l><"col-sm-6"f>>rt<"row"<"col-sm-6"i><"col-sm-6"p>>\',
-                        "pageLength": 10,
-                        "responsive": true,
-                        "order": [],
-                        "stateSave": true,
-                        "language": {
-                            "paginate": {
-                               "previous": "Previous",
-                                "next": "Next"
-                            },
-                            "info": "Showing _START_ to _END_ of _TOTAL_ entries",
-                            "infoEmpty": "Showing 0 to 0 of 0 entries",
-                            "lengthMenu": "Show _MENU_ entries"
-                        }
-                    });
-                }
-            });
-
-            // Initialize Select2 with AJAX for unassigned invoices in Add Invoice Modal
-            var initUnassignedInvoicesSelect2 = function() {
-                var selectEl = jQuery(".select2-ajax-unassigned-invoices");
-                if (selectEl.length && jQuery.fn.select2) {
-                    if (selectEl.hasClass("select2-hidden-accessible")) {
-                        selectEl.select2("destroy");
-                    }
-                    selectEl.empty();
-                    selectEl.select2({
-                        placeholder: "Search for an invoice by ID, Number, Client, or Company...",
-                        minimumInputLength: 0,
-                        width: "100%",
-                        dropdownParent: jQuery("#modal-add-invoice"),
-                        ajax: {
-                            url: "' . $modulelink . '&action=search_unassigned_invoices",
-                            dataType: "json",
-                            delay: 250,
-                            data: function (params) {
-                                return {
-                                    q: params.term // search query
-                                };
-                            },
-                            processResults: function (data) {
-                                return {
-                                    results: data.results
-                                };
-                            },
-                            cache: true
-                        }
-                    });
-                }
-            };
-
-            // Run on shown.bs.modal for invoice modal
-            jQuery("#modal-add-invoice").on("shown.bs.modal", function() {
-                initUnassignedInvoicesSelect2();
-            });
-
-            // Select All Checkboxes toggle for invoices
-            jQuery(document).on("click", "#invoice-select-all", function() {
-                var checked = this.checked;
-                jQuery(".invoice-item-checkbox").each(function() {
-                    this.checked = checked;
-                });
-            });
-
-            // Services Pricing - search table local filtering
-            jQuery(document).on("click", ".pricing-search-btn", function() {
-                jQuery(this).closest(".tab-pane").find(".pricing-search-wrapper").slideToggle(200);
-            });
-            jQuery(document).on("keyup", ".search-pricing-table", function() {
-                var val = jQuery(this).val().toLowerCase();
-                jQuery(this).closest(".tab-pane").find("table tbody tr").filter(function() {
-                    jQuery(this).toggle(jQuery(this).text().toLowerCase().indexOf(val) > -1);
-                });
-            });
-
-            // Select2 AJAX Autocomplete loaders for Assign Pricing modals
-            var initUnassignedProductsSelect2 = function() {
-                var selectEl = jQuery(".select2-ajax-unassigned-products");
-                if (selectEl.length && jQuery.fn.select2) {
-                    if (selectEl.hasClass("select2-hidden-accessible")) { selectEl.select2("destroy"); }
-                    selectEl.empty();
-                    selectEl.select2({
-                        placeholder: "Search for a product...",
-                        minimumInputLength: 0,
-                        width: "100%",
-                        dropdownParent: jQuery("#modal-assign-product"),
-                        ajax: {
-                            url: "' . $modulelink . '&action=search_unassigned_pricing_items&type=product&brand_id=' . $id . '",
-                            dataType: "json",
-                            delay: 250,
-                            data: function (params) {
-                                return {
-                                    q: params.term || ""
-                                };
-                            },
-                            processResults: function (data) { return { results: data.results }; },
-                            cache: true
-                        }
-                    });
-                }
-            };
-            jQuery("#modal-assign-product").on("shown.bs.modal", function() { initUnassignedProductsSelect2(); });
-
-            var initUnassignedAddonsSelect2 = function() {
-                var selectEl = jQuery(".select2-ajax-unassigned-addons");
-                if (selectEl.length && jQuery.fn.select2) {
-                    if (selectEl.hasClass("select2-hidden-accessible")) { selectEl.select2("destroy"); }
-                    selectEl.empty();
-                    selectEl.select2({
-                        placeholder: "Search for an addon...",
-                        minimumInputLength: 0,
-                        width: "100%",
-                        dropdownParent: jQuery("#modal-assign-addon"),
-                        ajax: {
-                            url: "' . $modulelink . '&action=search_unassigned_pricing_items&type=addon&brand_id=' . $id . '",
-                            dataType: "json",
-                            delay: 250,
-                            data: function (params) {
-                                return {
-                                    q: params.term || ""
-                                };
-                            },
-                            processResults: function (data) { return { results: data.results }; },
-                            cache: true
-                        }
-                    });
-                }
-            };
-            jQuery("#modal-assign-addon").on("shown.bs.modal", function() { initUnassignedAddonsSelect2(); });
-
-            var initUnassignedDomainsSelect2 = function() {
-                var selectEl = jQuery(".select2-ajax-unassigned-domains");
-                if (selectEl.length && jQuery.fn.select2) {
-                    if (selectEl.hasClass("select2-hidden-accessible")) { selectEl.select2("destroy"); }
-                    selectEl.empty();
-                    selectEl.select2({
-                        placeholder: "Search for a domain TLD...",
-                        minimumInputLength: 0,
-                        width: "100%",
-                        dropdownParent: jQuery("#modal-assign-domain"),
-                        ajax: {
-                            url: "' . $modulelink . '&action=search_unassigned_pricing_items&type=domain&brand_id=' . $id . '",
-                            dataType: "json",
-                            delay: 250,
-                            data: function (params) {
-                                return {
-                                    q: params.term || ""
-                                };
-                            },
-                            processResults: function (data) { return { results: data.results }; },
-                            cache: true
-                        }
-                    });
-                }
-            };
-            jQuery("#modal-assign-domain").on("shown.bs.modal", function() { initUnassignedDomainsSelect2(); });
-
-            var initUnassignedBundlesSelect2 = function() {
-                var selectEl = jQuery(".select2-ajax-unassigned-bundles");
-                if (selectEl.length && jQuery.fn.select2) {
-                    if (selectEl.hasClass("select2-hidden-accessible")) { selectEl.select2("destroy"); }
-                    selectEl.empty();
-                    selectEl.select2({
-                        placeholder: "Search for a bundle...",
-                        minimumInputLength: 0,
-                        width: "100%",
-                        dropdownParent: jQuery("#modal-assign-bundle"),
-                        ajax: {
-                            url: "' . $modulelink . '&action=search_unassigned_pricing_items&type=bundle&brand_id=' . $id . '",
-                            dataType: "json",
-                            delay: 250,
-                            data: function (params) {
-                                return {
-                                    q: params.term || ""
-                                };
-                            },
-                            processResults: function (data) { return { results: data.results }; },
-                            cache: true
-                        }
-                    });
-                }
-            };
-            jQuery("#modal-assign-bundle").on("shown.bs.modal", function() { initUnassignedBundlesSelect2(); });
-
-
-            // Dynamic Pricing Override Modal Renderer & Event handlers
-            var currencies = ' . json_encode($currenciesList) . ';
-            
-            jQuery(document).on("click", ".btn-pricing-override", function(e) {
-                e.preventDefault();
-                var type = jQuery(this).data("type");
-                var relid = jQuery(this).data("relid");
-                var name = jQuery(this).data("name");
-                
-                var modal = jQuery("#modal-pricing-override");
-                modal.find("input[name=\"type\"]").val(type);
-                modal.find("input[name=\"relid\"]").val(relid);
-                modal.find(".override-item-name").text(name);
-                
-                // Show loading state
-                modal.find(".currency-tabs-list").html("<li><a>Loading...</a></li>");
-                modal.find(".currency-tabs-content").html("<div class=\"text-center\" style=\"padding: 40px;\"><i class=\"fas fa-spinner fa-spin\" style=\"font-size: 2em; color: ' . $brandColor . ';\"></i><p style=\"margin-top: 10px;\">Fetching pricing templates...</p></div>");
-                modal.modal("show");
-                
-                // Fetch dynamic WHMCS templates + Brand overrides
-                jQuery.ajax({
-                    url: "' . $modulelink . '&action=get_pricing_override_ajax&brand_id=' . $id . '",
-                    data: { type: type, relid: relid },
-                    dataType: "json",
-                    success: function(resp) {
-                        renderPricingModal(resp);
-                    },
-                    error: function() {
-                        modal.find(".currency-tabs-content").html("<div class=\"alert alert-danger\">Error loading pricing templates. Please try again.</div>");
-                    }
-                });
-            });
-
-            // Collapsible Cycle Panel toggle
-            jQuery(document).on("click", ".cycle-panel-header", function() {
-                var body = jQuery(this).next(".cycle-panel-body");
-                body.slideToggle(200);
-                jQuery(this).find(".cycle-chevron").toggleClass("fa-chevron-down fa-chevron-up");
-            });
-
-            // Copy first/default currency rates to other tabs
-            jQuery(document).on("click", ".btn-copy-rates", function(e) {
-                e.preventDefault();
-                if (!confirm("Are you sure you want to copy the active tab rates to all other currency tabs?")) return;
-                
-                var activeTab = jQuery("#modal-pricing-override .currency-tab-pane.active");
-                if (!activeTab.length) return;
-                
-                var data = {};
-                activeTab.find("input").each(function() {
-                    var name = jQuery(this).attr("name");
-                    // Extract field name part e.g. pricing[1][monthly] -> monthly
-                    var parts = name.match(/pricing\[\d+\]\[([^\]]+)\]/);
-                    if (parts && parts[1]) {
-                        data[parts[1]] = jQuery(this).val();
-                    }
-                });
-                
-                jQuery("#modal-pricing-override .currency-tab-pane").not(activeTab).each(function() {
-                    var pane = jQuery(this);
-                    jQuery.each(data, function(key, val) {
-                        pane.find("input[name*=\"[" + key + "]\"]").val(val);
-                    });
-                });
-            });
-
-            // Reset current rates to standard WHMCS defaults
-            jQuery(document).on("click", ".btn-reset-rates", function(e) {
-                e.preventDefault();
-                if (!confirm("Are you sure you want to reset all overrides to standard WHMCS template pricing?")) return;
-                
-                jQuery("#modal-pricing-override .currency-tab-pane").each(function() {
-                    var pane = jQuery(this);
-                    pane.find("input").each(function() {
-                        var defaultVal = jQuery(this).data("default") || "0.00";
-                        jQuery(this).val(defaultVal);
-                    });
-                });
-            });
-
-            function renderPricingModal(data) {
-                var modal = jQuery("#modal-pricing-override");
-                var tabList = modal.find(".currency-tabs-list");
-                var tabContent = modal.find(".currency-tabs-content");
-                
-                tabList.empty();
-                tabContent.empty();
-                
-                if (!currencies || currencies.length === 0) {
-                    tabContent.html("<div class=\"alert alert-warning\">No currencies configured in WHMCS.</div>");
-                    return;
-                }
-                
-                jQuery.each(currencies, function(idx, curr) {
-                    var activeClass = (idx === 0) ? "active" : "";
-                    
-                    // Create Currency Tab Header
-                    tabList.append("<li class=\"" + activeClass + "\"><a href=\"#curr-tab-" + curr.id + "\" data-toggle=\"tab\" style=\"padding: 8px 16px; border: none; font-weight: bold;\">" + curr.code + "</a></li>");
-                    
-                    // Create Currency Tab Content
-                    var pane = jQuery("<div class=\"tab-pane currency-tab-pane " + activeClass + "\" id=\"curr-tab-" + curr.id + "\"></div>");
-                    
-                    var baseRates = data.base[curr.id] || {};
-                    var overrideRates = data.overrides[curr.id] || {};
-                    var cycleList = [];
-                    
-                    if (data.paymenttype === "free") {
-                        pane.append("<div class=\"text-center text-muted\" style=\"padding: 20px;\">This product is configured as Free in WHMCS. No overrides needed.</div>");
-                    } else if (data.paymenttype === "onetime") {
-                        cycleList = [
-                            { key: "onetime", label: "One Time", priceKey: "monthly", setupKey: "msetupfee" }
-                        ];
-                    } else if (data.paymenttype === "recurring" || data.paymenttype === "addon") {
-                        cycleList = [
-                            { key: "monthly", label: "Monthly", priceKey: "monthly", setupKey: "msetupfee" },
-                            { key: "quarterly", label: "Quarterly", priceKey: "quarterly", setupKey: "qsetupfee" },
-                            { key: "semiannually", label: "Semiannually", priceKey: "semiannually", setupKey: "ssetupfee" },
-                            { key: "annually", label: "Annually", priceKey: "annually", setupKey: "asetupfee" },
-                            { key: "biennially", label: "Biennially", priceKey: "biennially", setupKey: "bsetupfee" },
-                            { key: "triennially", label: "Triennially", priceKey: "triennially", setupKey: "tsetupfee" }
-                        ];
-                    } else if (data.paymenttype === "domain") {
-                        // Domains support 1 to 10 Years
-                        cycleList = [
-                            { key: "1year", label: "1 Year Register", priceKey: "register1", setupKey: "transfer1", renewKey: "renew1", isDomain: true },
-                            { key: "2year", label: "2 Years Register", priceKey: "register2", setupKey: "transfer2", renewKey: "renew2", isDomain: true },
-                            { key: "3year", label: "3 Years Register", priceKey: "register3", setupKey: "transfer3", renewKey: "renew3", isDomain: true },
-                            { key: "5year", label: "5 Years Register", priceKey: "register5", setupKey: "transfer5", renewKey: "renew5", isDomain: true },
-                            { key: "10year", label: "10 Years Register", priceKey: "register10", setupKey: "transfer10", renewKey: "renew10", isDomain: true }
-                        ];
-                    } else {
-                        // Fallback generic pricing
-                        cycleList = [
-                            { key: "onetime", label: "Price", priceKey: "monthly", setupKey: "msetupfee" }
-                        ];
-                    }
-                    
-                    jQuery.each(cycleList, function(cidx, cyc) {
-                        var isFirst = (cidx === 0);
-                        var collapseIcon = isFirst ? "fa-chevron-up" : "fa-chevron-down";
-                        var displayStyle = isFirst ? "" : "display: none;";
-                        
-                        var basePrice = baseRates[cyc.priceKey] !== undefined ? parseFloat(baseRates[cyc.priceKey]).toFixed(2) : "0.00";
-                        var baseSetup = baseRates[cyc.setupKey] !== undefined ? parseFloat(baseRates[cyc.setupKey]).toFixed(2) : "0.00";
-                        var baseRenew = cyc.isDomain && baseRates[cyc.renewKey] !== undefined ? parseFloat(baseRates[cyc.renewKey]).toFixed(2) : "0.00";
-                        
-                        // Overrides fallback to base WHMCS pricing if not set yet
-                        var overPrice = overrideRates[cyc.priceKey] !== undefined ? parseFloat(overrideRates[cyc.priceKey]).toFixed(2) : basePrice;
-                        var overSetup = overrideRates[cyc.setupKey] !== undefined ? parseFloat(overrideRates[cyc.setupKey]).toFixed(2) : baseSetup;
-                        var overRenew = cyc.isDomain && overrideRates[cyc.renewKey] !== undefined ? parseFloat(overrideRates[cyc.renewKey]).toFixed(2) : baseRenew;
-                        
-                        var cycPanel = jQuery(
-                            "<div class=\"cycle-panel\" style=\"margin-bottom: 12px; border: 1px solid #ddd; border-radius: 4px; overflow: hidden;\">" +
-                            "  <div class=\"cycle-panel-header\" style=\"background: #fcfcfc; padding: 10px 15px; font-weight: bold; color: #444; cursor: pointer; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #ddd;\">" +
-                            "    <span>" + cyc.label + "</span>" +
-                            "    <i class=\"fas " + collapseIcon + " cycle-chevron\" style=\"font-size: 0.9em; color: #777;\"></i>" +
-                            "  </div>" +
-                            "  <div class=\"cycle-panel-body\" style=\"padding: 15px 20px; background: #fff; " + displayStyle + "\">" +
-                            "    <div class=\"row\">" +
-                            "    </div>" +
-                            "  </div>" +
-                            "</div>"
-                        );
-                        
-                        var row = cycPanel.find(".row");
-                        
-                        if (cyc.isDomain) {
-                            row.append(
-                                "      <div class=\"col-sm-4\">" +
-                                "        <label style=\"font-weight: 500; font-size: 0.9em;\">Register Price</label>" +
-                                "        <div class=\"input-group input-group-sm\">" +
-                                "          <span class=\"input-group-addon\">" + curr.prefix + "</span>" +
-                                "          <input type=\"text\" class=\"form-control\" name=\"pricing[" + curr.id + "][" + cyc.priceKey + "]\" value=\"" + overPrice + "\" data-default=\"" + basePrice + "\">" +
-                                "        </div>" +
-                                "        <small class=\"text-muted\">Base: " + curr.prefix + basePrice + "</small>" +
-                                "      </div>" +
-                                "      <div class=\"col-sm-4\">" +
-                                "        <label style=\"font-weight: 500; font-size: 0.9em;\">Transfer Price</label>" +
-                                "        <div class=\"input-group input-group-sm\">" +
-                                "          <span class=\"input-group-addon\">" + curr.prefix + "</span>" +
-                                "          <input type=\"text\" class=\"form-control\" name=\"pricing[" + curr.id + "][" + cyc.setupKey + "]\" value=\"" + overSetup + "\" data-default=\"" + baseSetup + "\">" +
-                                "        </div>" +
-                                "        <small class=\"text-muted\">Base: " + curr.prefix + baseSetup + "</small>" +
-                                "      </div>" +
-                                "      <div class=\"col-sm-4\">" +
-                                "        <label style=\"font-weight: 500; font-size: 0.9em;\">Renew Price</label>" +
-                                "        <div class=\"input-group input-group-sm\">" +
-                                "          <span class=\"input-group-addon\">" + curr.prefix + "</span>" +
-                                "          <input type=\"text\" class=\"form-control\" name=\"pricing[" + curr.id + "][" + cyc.renewKey + "]\" value=\"" + overRenew + "\" data-default=\"" + baseRenew + "\">" +
-                                "        </div>" +
-                                "        <small class=\"text-muted\">Base: " + curr.prefix + baseRenew + "</small>" +
-                                "      </div>"
-                            );
-                        } else {
-                            row.append(
-                                "      <div class=\"col-sm-6\">" +
-                                "        <label style=\"font-weight: 500; font-size: 0.9em;\">Price</label>" +
-                                "        <div class=\"input-group input-group-sm\">" +
-                                "          <span class=\"input-group-addon\">" + curr.prefix + "</span>" +
-                                "          <input type=\"text\" class=\"form-control\" name=\"pricing[" + curr.id + "][" + cyc.priceKey + "]\" value=\"" + overPrice + "\" data-default=\"" + basePrice + "\">" +
-                                "        </div>" +
-                                "        <small class=\"text-muted\">Base: " + curr.prefix + basePrice + "</small>" +
-                                "      </div>" +
-                                "      <div class=\"col-sm-6\">" +
-                                "        <label style=\"font-weight: 500; font-size: 0.9em;\">Setup Fee</label>" +
-                                "        <div class=\"input-group input-group-sm\">" +
-                                "          <span class=\"input-group-addon\">" + curr.prefix + "</span>" +
-                                "          <input type=\"text\" class=\"form-control\" name=\"pricing[" + curr.id + "][" + cyc.setupKey + "]\" value=\"" + overSetup + "\" data-default=\"" + baseSetup + "\">" +
-                                "        </div>" +
-                                "        <small class=\"text-muted\">Base: " + curr.prefix + baseSetup + "</small>" +
-                                "      </div>"
-                            );
-                        }
-                        
-                        pane.append(cycPanel);
-                    });
-                    
-                    tabContent.append(pane);
-                });
-            }
-        });
-        </script>';
-
-        // Assign Product modal
-        $output .= '
-        <div id="modal-assign-product" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-cube" style="margin-right: 8px;"></i> Assign Product</h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">
-                        <input type="hidden" name="brand_id" value="' . $id . '">
-                        <input type="hidden" name="type" value="product">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <div class="form-group" style="margin-bottom: 20px;">
-                                <label style="font-weight: bold; color: #555; display: block; margin-bottom: 8px; font-size: 0.95em;">Product Name</label>
-                                <select name="item_id" class="form-control select2-ajax-unassigned-products" style="width: 100%;">
-                                </select>
-                                <small class="text-muted" style="display: block; margin-top: 5px; font-size: 0.82em; color: #777;">Please select a product that you wish to add to the current brand.</small>
-                            </div>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; padding: 6px 16px; font-weight: 600; border-radius: 4px;">Save</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        // Assign Addon modal
-        $output .= '
-        <div id="modal-assign-addon" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-puzzle-piece" style="margin-right: 8px;"></i> Assign Addon</h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">
-                        <input type="hidden" name="brand_id" value="' . $id . '">
-                        <input type="hidden" name="type" value="addon">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <div class="form-group" style="margin-bottom: 20px;">
-                                <label style="font-weight: bold; color: #555; display: block; margin-bottom: 8px; font-size: 0.95em;">Addon Name</label>
-                                <select name="item_id" class="form-control select2-ajax-unassigned-addons" style="width: 100%;">
-                                </select>
-                                <small class="text-muted" style="display: block; margin-top: 5px; font-size: 0.82em; color: #777;">Please select an addon that you wish to add to the current brand.</small>
-                            </div>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; padding: 6px 16px; font-weight: 600; border-radius: 4px;">Save</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        // Assign Domain modal
-        $output .= '
-        <div id="modal-assign-domain" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-globe" style="margin-right: 8px;"></i> Assign Domain</h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">
-                        <input type="hidden" name="brand_id" value="' . $id . '">
-                        <input type="hidden" name="type" value="domain">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <div class="form-group" style="margin-bottom: 20px;">
-                                <label style="font-weight: bold; color: #555; display: block; margin-bottom: 8px; font-size: 0.95em;">Domain TLD Extension</label>
-                                <select name="item_id" class="form-control select2-ajax-unassigned-domains" style="width: 100%;">
-                                </select>
-                                <small class="text-muted" style="display: block; margin-top: 5px; font-size: 0.82em; color: #777;">Please select a domain TLD that you wish to add to the current brand.</small>
-                            </div>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; padding: 6px 16px; font-weight: 600; border-radius: 4px;">Save</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        // Assign Bundle modal
-        $output .= '
-        <div id="modal-assign-bundle" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-box-open" style="margin-right: 8px;"></i> Assign Bundle</h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=assign_pricing_item">
-                        <input type="hidden" name="brand_id" value="' . $id . '">
-                        <input type="hidden" name="type" value="bundle">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <div class="form-group" style="margin-bottom: 20px;">
-                                <label style="font-weight: bold; color: #555; display: block; margin-bottom: 8px; font-size: 0.95em;">Bundle Name</label>
-                                <select name="item_id" class="form-control select2-ajax-unassigned-bundles" style="width: 100%;">
-                                </select>
-                                <small class="text-muted" style="display: block; margin-top: 5px; font-size: 0.82em; color: #777;">Please select a bundle that you wish to add to the current brand.</small>
-                            </div>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; padding: 6px 16px; font-weight: 600; border-radius: 4px;">Save</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        // Bulk Add Products modal
-        $output .= '
-        <div id="modal-bulk-add-products" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-cubes" style="margin-right: 8px;"></i> Bulk Add Products</h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">
-                        <input type="hidden" name="brand_id" value="' . $id . '">
-                        <input type="hidden" name="type" value="product">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <p style="font-size: 0.95em; color: #555; line-height: 1.5; margin: 0;">
-                                This action will add all available products configured in WHMCS. Are you sure you want to proceed?
-                            </p>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-primary" style="padding: 6px 16px; font-weight: 600; border-radius: 4px;">Confirm</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        // Bulk Add Addons modal
-        $output .= '
-        <div id="modal-bulk-add-addons" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-cubes" style="margin-right: 8px;"></i> Bulk Add Addons</h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">
-                        <input type="hidden" name="brand_id" value="' . $id . '">
-                        <input type="hidden" name="type" value="addon">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <p style="font-size: 0.95em; color: #555; line-height: 1.5; margin: 0;">
-                                This action will add all available addons configured in WHMCS. Are you sure you want to proceed?
-                            </p>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-primary" style="padding: 6px 16px; font-weight: 600; border-radius: 4px;">Confirm</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        // Bulk Add Domains modal
-        $output .= '
-        <div id="modal-bulk-add-domains" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-globe" style="margin-right: 8px;"></i> Bulk Add Domains</h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">
-                        <input type="hidden" name="brand_id" value="' . $id . '">
-                        <input type="hidden" name="type" value="domain">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <p style="font-size: 0.95em; color: #555; line-height: 1.5; margin: 0;">
-                                This action will add all available domain extensions configured in WHMCS. Are you sure you want to proceed?
-                            </p>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-primary" style="padding: 6px 16px; font-weight: 600; border-radius: 4px;">Confirm</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        // Bulk Add Bundles modal
-        $output .= '
-        <div id="modal-bulk-add-bundles" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-box-open" style="margin-right: 8px;"></i> Bulk Add Bundles</h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=bulk_add_pricing_items">
-                        <input type="hidden" name="brand_id" value="' . $id . '">
-                        <input type="hidden" name="type" value="bundle">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <p style="font-size: 0.95em; color: #555; line-height: 1.5; margin: 0;">
-                                This action will add all available bundles configured in WHMCS. Are you sure you want to proceed?
-                            </p>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-primary" style="padding: 6px 16px; font-weight: 600; border-radius: 4px;">Confirm</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        // Pricing Override modal
-        $output .= '
-        <div id="modal-pricing-override" class="modal fade" role="dialog" style="display: none;">
-            <div class="modal-dialog modal-lg">
-                <div class="modal-content" style="border-radius: 6px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.15);">
-                    <div class="modal-header" style="background: #fafafa; border-bottom: 1px solid #e5e5e5; padding: 15px 20px;">
-                        <button type="button" class="close" data-dismiss="modal" style="font-size: 22px; line-height: 1; opacity: 0.5;">&times;</button>
-                        <h4 class="modal-title" style="font-weight: bold; font-family: \'Outfit\', sans-serif; color: #333;"><i class="fas fa-dollar-sign" style="margin-right: 8px;"></i> Pricing: <span class="override-item-name" style="color: ' . $brandColor . ';">-</span></h4>
-                    </div>
-                    <form method="post" action="' . $modulelink . '&action=save_pricing_override">
-                        <input type="hidden" name="brand_id" value="' . $id . '">
-                        <input type="hidden" name="type" value="">
-                        <input type="hidden" name="relid" value="">
-                        
-                        <div class="modal-body" style="padding: 25px; font-family: \'Outfit\', sans-serif;">
-                            <!-- Dynamic Currency Tabs Header -->
-                            <div style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #ddd; margin-bottom: 20px; padding-bottom: 5px;">
-                                <ul class="nav nav-tabs currency-tabs-list" style="border-bottom: none; margin: 0; display: flex; gap: 5px;">
-                                    <!-- Populated dynamically via JS -->
-                                </ul>
-                                <div style="display: flex; gap: 5px;">
-                                    <button type="button" class="btn btn-default btn-sm btn-copy-rates" title="Copy active tab rates to all other currency tabs" style="border-radius: 4px; padding: 5px 10px; font-weight: bold;"><i class="fas fa-equals"></i></button>
-                                    <button type="button" class="btn btn-default btn-sm btn-reset-rates" title="Reset to standard WHMCS pricing template" style="border-radius: 4px; padding: 5px 10px; font-weight: bold;"><i class="fas fa-sync-alt"></i></button>
-                                </div>
-                            </div>
-                            
-                            <!-- Dynamic Currency Tab Contents -->
-                            <div class="tab-content currency-tabs-content">
-                                <!-- Populated dynamically via JS -->
-                            </div>
-                        </div>
-                        
-                        <div class="modal-footer" style="background: #fafafa; border-top: 1px solid #e5e5e5; padding: 15px 20px;">
-                            <button type="submit" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; padding: 6px 16px; font-weight: 600; border-radius: 4px;">Save</button>
-                            <button type="button" class="btn btn-default" data-dismiss="modal" style="padding: 6px 16px; border-radius: 4px;">Close</button>
-                        </div>
-                    </form>
-                </div>
-            </div>
-        </div>';
-
-        return print_r($output);
-    }
+    
 
     /**
      * Search unassigned products, addons, domains, or bundles for Services Pricing Select2 dropdowns
@@ -7321,7 +6221,7 @@ class Controller
             } elseif ($type == 'domain') {
                 $response['paymenttype'] = 'domain';
             } elseif ($type == 'bundle') {
-                $response['paymenttype'] = 'recurring';
+                $response['paymenttype'] = 'bundle';
             }
 
             // Fetch base standard WHMCS pricing from tblpricing
@@ -7352,15 +6252,27 @@ class Controller
                     }
                 }
             } else {
-                $pricingType = $type == 'product' ? 'product' : 'addon';
-                $basePrices = Capsule::table('tblpricing')
-                    ->where('type', $pricingType)
-                    ->where('relid', $relid)
-                    ->get();
-                
-                foreach ($basePrices as $bp) {
-                    $currId = $bp->currency;
-                    $response['base'][$currId] = (array)$bp;
+                if ($type == 'bundle') {
+                    $bundle = Capsule::table('tblbundles')->where('id', $relid)->first();
+                    $baseDisplayPrice = $bundle ? (float)$bundle->displayprice : 0.00;
+                    
+                    $currencies = Capsule::table('tblcurrencies')->get();
+                    foreach ($currencies as $curr) {
+                        $response['base'][$curr->id] = [
+                            'displayprice' => $baseDisplayPrice
+                        ];
+                    }
+                } else {
+                    $pricingType = $type == 'product' ? 'product' : 'addon';
+                    $basePrices = Capsule::table('tblpricing')
+                        ->where('type', $pricingType)
+                        ->where('relid', $relid)
+                        ->get();
+                    
+                    foreach ($basePrices as $bp) {
+                        $currId = $bp->currency;
+                        $response['base'][$currId] = (array)$bp;
+                    }
                 }
             }
 
@@ -7399,203 +6311,18 @@ class Controller
         }
 
         $_REQUEST['id'] = $brandId;
-        return $this->relations($vars);
+        return $this->edit($vars);
     }
 
-    /**
-     * Reassign/swap brands for a client
-     */
-    public function reassign_client($vars)
-    {
-        $brandId = (int) $_REQUEST['brand_id'];
-        $clientId = (int) $_REQUEST['client_id'];
-        $modulelink = $vars['modulelink'];
+    
 
-        $client = Capsule::table('tblclients')->find($clientId);
-        if (!$client) {
-            return '<div class="alert alert-danger">Client not found.</div>';
-        }
+    
 
-        $brands = Capsule::table('mod_multibrand_brands')->get();
-        $assignedBrandIds = Capsule::table('mod_multibrand_client_brands')
-            ->where('client_id', $clientId)
-            ->pluck('brand_id')
-            ->toArray();
+    
 
-        $output = '<h3>Manage Brands for Client: ' . htmlspecialchars($client->firstname . ' ' . $client->lastname) . '</h3>';
-        $output .= '<form method="post" action="' . $modulelink . '&action=save_client_brands">';
-        $output .= '<input type="hidden" name="client_id" value="' . $clientId . '">';
-        $output .= '<input type="hidden" name="brand_id" value="' . $brandId . '">';
-        
-        $output .= '<div class="panel panel-default" style="margin-top: 20px; max-width: 600px;">
-            <div class="panel-body">';
-        
-        foreach ($brands as $b) {
-            $checked = in_array($b->id, $assignedBrandIds) ? ' checked' : '';
-            $output .= '<div class="checkbox" style="margin: 10px 0;">
-                <label style="font-size: 1.1em; cursor: pointer;">
-                    <input type="checkbox" name="brand_ids[]" value="' . $b->id . '"' . $checked . '> ' . htmlspecialchars($b->brand_name) . ' (' . htmlspecialchars($b->domain) . ')
-                </label>
-            </div>';
-        }
+    
 
-        $output .= '<div style="margin-top: 20px;">
-            <button type="submit" class="btn btn-primary">Save Changes</button>
-            <a href="' . $modulelink . '&action=relations&id=' . $brandId . '" class="btn btn-default" style="margin-left: 10px;">Cancel</a>
-        </div>';
-
-        $output .= '</div></div></form>';
-
-        return print_r($output);
-    }
-
-    /**
-     * Save updated brand assignments for a client
-     */
-    public function save_client_brands($vars)
-    {
-        $clientId = (int) $_POST['client_id'];
-        $brandId = (int) $_POST['brand_id'];
-        $submittedBrandIds = isset($_POST['brand_ids']) ? array_map('intval', $_POST['brand_ids']) : [];
-
-        try {
-            Capsule::table('mod_multibrand_client_brands')->where('client_id', $clientId)->delete();
-            foreach ($submittedBrandIds as $bId) {
-                if ($bId > 0) {
-                    Capsule::table('mod_multibrand_client_brands')->insert([
-                        'client_id' => $clientId,
-                        'brand_id' => $bId,
-                        'created_at' => date('Y-m-d H:i:s'),
-                        'updated_at' => date('Y-m-d H:i:s'),
-                    ]);
-                }
-            }
-            echo '<div class="alert alert-success">Client brand relationships updated successfully.</div>';
-        } catch (\Exception $e) {
-            echo '<div class="alert alert-danger">Error updating brand relationships: ' . $e->getMessage() . '</div>';
-        }
-
-        $_REQUEST['id'] = $brandId;
-        return $this->relations($vars);
-    }
-
-    /**
-     * Add brand relation to a client
-     */
-    public function add_relation($vars)
-    {
-        $brandId = (int) $_REQUEST['brand_id'];
-        $modulelink = $vars['modulelink'];
-
-        $brand = Capsule::table('mod_multibrand_brands')->find($brandId);
-        if (!$brand) {
-            return '<div class="alert alert-danger">Brand not found.</div>';
-        }
-
-        // Get all clients in WHMCS
-        $clients = Capsule::table('tblclients')
-            ->select('id', 'firstname', 'lastname', 'email', 'companyname')
-            ->orderBy('firstname', 'asc')
-            ->get();
-
-        // Get already assigned client IDs for this brand
-        $assignedClientIds = Capsule::table('mod_multibrand_client_brands')
-            ->where('brand_id', $brandId)
-            ->pluck('client_id')
-            ->toArray();
-
-        $output = '<h3>Assign Client to Brand: ' . htmlspecialchars($brand->brand_name) . '</h3>';
-        $output .= '<form method="post" action="' . $modulelink . '&action=save_relation">';
-        $output .= '<input type="hidden" name="brand_id" value="' . $brandId . '">';
-        
-        $output .= '<div class="panel panel-default" style="margin-top: 20px; max-width: 600px;">
-            <div class="panel-body">
-                <div class="form-group">
-                    <label for="client_id">Select Client</label>
-                    <select name="client_id" id="client_id" class="form-control select-inline" style="width: 100%; min-width: 300px;">';
-        
-        foreach ($clients as $client) {
-            $disabled = in_array($client->id, $assignedClientIds) ? ' disabled style="color:#aaa;"' : '';
-            $company = $client->companyname ? ' (' . $client->companyname . ')' : '';
-            $output .= '<option value="' . $client->id . '"' . $disabled . '>' 
-                . htmlspecialchars($client->firstname . ' ' . $client->lastname) 
-                . ' - ' . htmlspecialchars($client->email) 
-                . $company 
-                . (in_array($client->id, $assignedClientIds) ? ' [Already Assigned]' : '') 
-                . '</option>';
-        }
-
-        $output .= '      </select>
-                </div>
-                <div style="margin-top: 20px;">
-                    <button type="submit" class="btn btn-primary">Assign Client</button>
-                    <a href="' . $modulelink . '&action=relations&id=' . $brandId . '" class="btn btn-default" style="margin-left: 10px;">Cancel</a>
-                </div>
-            </div>
-        </div></form>';
-
-        return print_r($output);
-    }
-
-    /**
-     * Save new brand relation for a client
-     */
-    public function save_relation($vars)
-    {
-        $brandId = (int) $_POST['brand_id'];
-        $clientId = (int) $_POST['client_id'];
-
-        try {
-            $exists = Capsule::table('mod_multibrand_client_brands')
-                ->where('client_id', $clientId)
-                ->where('brand_id', $brandId)
-                ->exists();
-
-            if (!$exists) {
-                Capsule::table('mod_multibrand_client_brands')->insert([
-                    'client_id' => $clientId,
-                    'brand_id' => $brandId,
-                    'created_at' => date('Y-m-d H:i:s'),
-                    'updated_at' => date('Y-m-d H:i:s'),
-                ]);
-                echo '<div class="alert alert-success">Client assigned to brand successfully.</div>';
-            } else {
-                echo '<div class="alert alert-warning">Client is already assigned to this brand.</div>';
-            }
-        } catch (\Exception $e) {
-            echo '<div class="alert alert-danger">Error assigning client: ' . $e->getMessage() . '</div>';
-        }
-
-        $_REQUEST['id'] = $brandId;
-        return $this->relations($vars);
-    }
-
-    /**
-     * Bulk unlink multiple clients from a brand from Relations Dashboard
-     */
-    public function bulk_unlink_client($vars)
-    {
-        $brandId = (int) $_POST['brand_id'];
-        $clientIds = isset($_POST['client_ids']) ? array_map('intval', $_POST['client_ids']) : [];
-
-        if (!empty($clientIds)) {
-            try {
-                Capsule::table('mod_multibrand_client_brands')
-                    ->where('brand_id', $brandId)
-                    ->whereIn('client_id', $clientIds)
-                    ->delete();
-
-                echo '<div class="alert alert-success">Selected client brand relationships deleted successfully.</div>';
-            } catch (\Exception $e) {
-                echo '<div class="alert alert-danger">Error deleting selected client relations: ' . $e->getMessage() . '</div>';
-            }
-        } else {
-            echo '<div class="alert alert-warning">No clients selected.</div>';
-        }
-
-        $_REQUEST['id'] = $brandId;
-        return $this->relations($vars);
-    }
+    
 
     /**
      * Bulk unlink multiple clients from a brand from Brand Edit page
@@ -7732,7 +6459,7 @@ class Controller
 
         $_REQUEST['id'] = $brandId;
         if ($redirect == 'relations') {
-            return $this->relations($vars);
+            return $this->edit($vars);
         }
         return $this->edit($vars);
     }
@@ -7808,7 +6535,7 @@ class Controller
 
         $_REQUEST['id'] = $currentBrandId;
         if ($redirect == 'relations') {
-            return $this->relations($vars);
+            return $this->edit($vars);
         }
         return $this->edit($vars);
     }
@@ -8526,7 +7253,7 @@ class Controller
         if ($redirect === 'edit') {
             return $this->edit($vars);
         }
-        return $this->relations($vars);
+        return $this->edit($vars);
     }
 
     /**
@@ -8552,7 +7279,7 @@ class Controller
         if ($redirect === 'edit') {
             return $this->edit($vars);
         }
-        return $this->relations($vars);
+        return $this->edit($vars);
     }
 
     /**
@@ -8578,7 +7305,7 @@ class Controller
         if ($redirect === 'edit') {
             return $this->edit($vars);
         }
-        return $this->relations($vars);
+        return $this->edit($vars);
     }
 
     /**
@@ -8604,7 +7331,7 @@ class Controller
         if ($redirect === 'edit') {
             return $this->edit($vars);
         }
-        return $this->relations($vars);
+        return $this->edit($vars);
     }
 
     /**
@@ -8634,7 +7361,7 @@ class Controller
         if ($redirect === 'edit') {
             return $this->edit($vars);
         }
-        return $this->relations($vars);
+        return $this->edit($vars);
     }
 
     /**
@@ -8664,7 +7391,7 @@ class Controller
         if ($redirect === 'edit') {
             return $this->edit($vars);
         }
-        return $this->relations($vars);
+        return $this->edit($vars);
     }
 
     /**
@@ -8694,7 +7421,7 @@ class Controller
         if ($redirect === 'edit') {
             return $this->edit($vars);
         }
-        return $this->relations($vars);
+        return $this->edit($vars);
     }
 
     /**
@@ -8787,7 +7514,7 @@ class Controller
 
         $_REQUEST['id'] = $brandId;
         if ($redirect === 'relations') {
-            return $this->relations($vars);
+            return $this->edit($vars);
         }
         return $this->edit($vars);
     }
@@ -8814,7 +7541,7 @@ class Controller
 
         $_REQUEST['id'] = $brandId;
         if ($redirect === 'relations') {
-            return $this->relations($vars);
+            return $this->edit($vars);
         }
         return $this->edit($vars);
     }
@@ -8845,7 +7572,7 @@ class Controller
 
         $_REQUEST['id'] = $brandId;
         if ($redirect === 'relations') {
-            return $this->relations($vars);
+            return $this->edit($vars);
         }
         return $this->edit($vars);
     }
@@ -8934,7 +7661,7 @@ class Controller
 
         $_REQUEST['id'] = $brandId;
         if ($redirect === 'relations') {
-            return $this->relations($vars);
+            return $this->edit($vars);
         }
         return $this->edit($vars);
     }
@@ -8961,7 +7688,7 @@ class Controller
 
         $_REQUEST['id'] = $brandId;
         if ($redirect === 'relations') {
-            return $this->relations($vars);
+            return $this->edit($vars);
         }
         return $this->edit($vars);
     }
@@ -8992,7 +7719,7 @@ class Controller
 
         $_REQUEST['id'] = $brandId;
         if ($redirect === 'relations') {
-            return $this->relations($vars);
+            return $this->edit($vars);
         }
         return $this->edit($vars);
     }
@@ -9082,7 +7809,7 @@ class Controller
 
         $_REQUEST['id'] = $brandId;
         if ($redirect === 'relations') {
-            return $this->relations($vars);
+            return $this->edit($vars);
         }
         return $this->edit($vars);
     }
@@ -9109,7 +7836,7 @@ class Controller
 
         $_REQUEST['id'] = $brandId;
         if ($redirect === 'relations') {
-            return $this->relations($vars);
+            return $this->edit($vars);
         }
         return $this->edit($vars);
     }
@@ -9140,7 +7867,7 @@ class Controller
 
         $_REQUEST['id'] = $brandId;
         if ($redirect === 'relations') {
-            return $this->relations($vars);
+            return $this->edit($vars);
         }
         return $this->edit($vars);
     }

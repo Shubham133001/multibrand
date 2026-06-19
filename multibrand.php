@@ -72,6 +72,7 @@ function multibrand_activate()
                 $table->boolean('status')->default(1);
                 $table->boolean('products_branding')->default(0);
                 $table->boolean('price_override')->default(0);
+                $table->text('pricing_overrides')->nullable();
                 $table->boolean('brand_switcher')->default(0);
                 $table->text('ticket_departments')->nullable();
                 $table->string('order_template')->nullable();
@@ -82,80 +83,7 @@ function multibrand_activate()
                 $table->text('payment_gateways')->nullable();
                 $table->timestamps();
             });
-        } else {
-            // Add missing columns if they don't exist
-            Capsule::schema()->table('mod_multibrand_brands', function ($table) {
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'system_theme')) {
-                    $table->string('system_theme')->nullable()->after('system_url');
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'brand_color')) {
-                    $table->string('brand_color')->nullable()->after('system_theme');
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'maintenance_mode')) {
-                    $table->boolean('maintenance_mode')->default(0)->after('brand_color');
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'maintenance_mode_message')) {
-                    $table->text('maintenance_mode_message')->nullable()->after('maintenance_mode');
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'maintenance_mode_redirect_url')) {
-                    $table->string('maintenance_mode_redirect_url')->nullable()->after('maintenance_mode_message');
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'status')) {
-                    $table->boolean('status')->default(1)->after('is_default');
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'proforma_invoice')) {
-                    $table->boolean('proforma_invoice')->default(0);
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'invoice_number_branding')) {
-                    $table->boolean('invoice_number_branding')->default(0);
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'zero_invoices_number_branding')) {
-                    $table->boolean('zero_invoices_number_branding')->default(0);
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'sequential_invoice_number_format')) {
-                    $table->string('sequential_invoice_number_format')->nullable();
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'next_sequential_number')) {
-                    $table->integer('next_sequential_number')->nullable();
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'brand_currencies')) {
-                    $table->text('brand_currencies')->nullable();
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'default_currency')) {
-                    $table->string('default_currency')->nullable();
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'products_branding')) {
-                    $table->boolean('products_branding')->default(0);
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'price_override')) {
-                    $table->boolean('price_override')->default(0);
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'brand_switcher')) {
-                    $table->boolean('brand_switcher')->default(0);
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'ticket_departments')) {
-                    $table->text('ticket_departments')->nullable();
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'order_template')) {
-                    $table->string('order_template')->nullable();
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'default_language')) {
-                    $table->string('default_language')->nullable();
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'auto_client_assignment')) {
-                    $table->boolean('auto_client_assignment')->default(0);
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'tos_url')) {
-                    $table->string('tos_url')->nullable();
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'signature')) {
-                    $table->text('signature')->nullable();
-                }
-                if (!Capsule::schema()->hasColumn('mod_multibrand_brands', 'payment_gateways')) {
-                    $table->text('payment_gateways')->nullable();
-                }
-            });
-        }
+        } 
 
         // Create table for client-brand association if needed
         if (!Capsule::schema()->hasTable('mod_multibrand_client_brands')) {
@@ -166,21 +94,7 @@ function multibrand_activate()
                 $table->timestamps();
                 $table->unique(['client_id', 'brand_id']);
             });
-        } else {
-            // Migrate existing table to drop old unique key on client_id and add composite unique key
-            try {
-                Capsule::schema()->table('mod_multibrand_client_brands', function ($table) {
-                    try {
-                        $table->dropUnique('mod_multibrand_client_brands_client_id_unique');
-                    } catch (\Exception $e) {}
-                    try {
-                        $table->unique(['client_id', 'brand_id']);
-                    } catch (\Exception $e) {}
-                });
-            } catch (\Exception $e) {
-                // Ignore
-            }
-        }
+        } 
 
         // Create table for invoice-brand association if needed
         if (!Capsule::schema()->hasTable('mod_multibrand_invoice_brands')) {
@@ -304,6 +218,43 @@ function multibrand_activate()
             });
         }
 
+        // Insert default brand if table is empty
+        try {
+            $brandCount = Capsule::table('mod_multibrand_brands')->count();
+            if ($brandCount === 0) {
+                $companyName = Capsule::table('tblconfiguration')->where('setting', 'CompanyName')->value('value') ?: 'Main Company';
+                $emailAddress = Capsule::table('tblconfiguration')->where('setting', 'Email')->value('value') ?: (Capsule::table('tblconfiguration')->where('setting', 'SystemEmailsFromEmail')->value('value') ?: 'admin@company.com');
+                $systemUrl = Capsule::table('tblconfiguration')->where('setting', 'SystemURL')->value('value') ?: 'http://localhost';
+                $defaultTheme = Capsule::table('tblconfiguration')->where('setting', 'Template')->value('value') ?: (Capsule::table('tblconfiguration')->where('setting', 'DefaultTheme')->value('value') ?: 'twenty-one');
+                $defaultLanguage = Capsule::table('tblconfiguration')->where('setting', 'Language')->value('value') ?: 'english';
+
+                $domainHost = parse_url($systemUrl, PHP_URL_HOST);
+                $domain = $domainHost ? $domainHost : (Capsule::table('tblconfiguration')->where('setting', 'Domain')->value('value') ?: 'localhost');
+                
+                $domainUrl = $domain;
+                if (strpos($domainUrl, '://') === false) {
+                    $domainUrl = 'http://' . $domainUrl;
+                }
+
+                Capsule::table('mod_multibrand_brands')->insert([
+                    'brand_name' => 'Default Brand',
+                    'company_name' => $companyName,
+                    'email_address' => $emailAddress,
+                    'domain' => $domainUrl,
+                    'system_url' => $systemUrl,
+                    'system_theme' => $defaultTheme,
+                    'brand_color' => '#0D6EFD',
+                    'default_language' => $defaultLanguage,
+                    'is_default' => 1,
+                    'status' => 1,
+                    'created_at' => date('Y-m-d H:i:s'),
+                    'updated_at' => date('Y-m-d H:i:s')
+                ]);
+            }
+        } catch (\Exception $e) {
+            // Ignore/log
+        }
+
         return array("status" => "success", "description" => "Multi Brand module activated successfully");
     } catch (Exception $e) {
         return array("status" => "error", "description" => "Failed to activate: " . $e->getMessage());
@@ -317,6 +268,18 @@ function multibrand_deactivate()
 {
     try {
         // Capsule::schema()->dropIfExists('mod_multibrand_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_client_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_invoice_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_announcement_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_download_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_promotion_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_billable_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_email_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_email_templates');
+        // Capsule::schema()->dropIfExists('mod_multibrand_kb_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_order_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_service_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_ticket_brands');
         return array("status" => "success", "description" => "Multi Brand module deactivated successfully");
     } catch (Exception $e) {
         return array("status" => "error", "description" => "Failed to deactivate: " . $e->getMessage());
