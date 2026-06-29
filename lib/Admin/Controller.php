@@ -69,39 +69,6 @@ class Controller
             }
         }
 
-        // Migrate client-brand unique index to support multiple brands
-        if (Capsule::schema()->hasTable('mod_multibrand_client_brands')) {
-            try {
-                Capsule::schema()->table('mod_multibrand_client_brands', function ($table) {
-                    try {
-                        $table->dropUnique('mod_multibrand_client_brands_client_id_unique');
-                    } catch (\Exception $e) {}
-                    try {
-                        $table->unique(['client_id', 'brand_id']);
-                    } catch (\Exception $e) {}
-                });
-            } catch (\Exception $e) {
-                // Ignore
-            }
-        }
-
-        // Dynamically create mod_multibrand_email_templates if it doesn't exist
-        if (!Capsule::schema()->hasTable('mod_multibrand_email_templates')) {
-            try {
-                Capsule::schema()->create('mod_multibrand_email_templates', function ($table) {
-                    $table->increments('id');
-                    $table->integer('brand_id');
-                    $table->string('template_name');
-                    $table->boolean('status')->default(0);
-                    $table->text('copy_to')->nullable();
-                    $table->text('blind_copy_to')->nullable();
-                    $table->text('translations')->nullable();
-                    $table->timestamps();
-                    $table->unique(['brand_id', 'template_name']);
-                });
-            } catch (\Exception $e) {}
-        }
-
         $brands = Capsule::table('mod_multibrand_brands')->get();
 
         $output = '<h2>Multi Brand Management</h2>';
@@ -193,7 +160,15 @@ class Controller
      */
     public function add($vars)
     {
-        return $this->renderForm($vars);
+        $brand = null;
+        if (isset($_REQUEST['validation_error'])) {
+            $brand = new \stdClass();
+            foreach ($_POST as $key => $val) {
+                $brand->$key = $val;
+            }
+            $brand->id = 0;
+        }
+        return $this->renderForm($vars, $brand);
     }
 
     /**
@@ -213,9 +188,13 @@ class Controller
             return '<div class="alert alert-danger">Brand not found.</div>' . $this->index($vars);
         }
 
-        // Dynamically migrate mod_multibrand_kb_brands to rename kb_id to article_id and update unique index
-        if (Capsule::schema()->hasTable('mod_multibrand_kb_brands')) {
-            if (!Capsule::schema()->hasColumn('mod_multibrand_kb_brands', 'article_id')) {
+        if (isset($_REQUEST['validation_error']) && $brand) {
+            foreach ($_POST as $key => $val) {
+                if (property_exists($brand, $key)) {
+                    $brand->$key = $val;
+                }
+            }
+        }
                 try {
                     $existingRows = Capsule::table('mod_multibrand_kb_brands')->get()->toArray();
                     Capsule::schema()->dropIfExists('mod_multibrand_kb_brands');
@@ -238,49 +217,8 @@ class Controller
                             ]);
                         }
                     }
-                } catch (\Exception $e) {
-                    try {
-                        Capsule::schema()->create('mod_multibrand_kb_brands', function ($table) {
-                            $table->increments('id');
-                            $table->integer('article_id');
-                            $table->integer('brand_id');
-                            $table->timestamps();
-                            $table->unique(['article_id', 'brand_id']);
-                        });
-                    } catch (\Exception $ex) {}
-                }
-            } else {
-                try {
-                    Capsule::schema()->table('mod_multibrand_kb_brands', function ($table) {
-                        try {
-                            $table->dropUnique('mod_multibrand_kb_brands_kb_id_unique');
-                        } catch (\Exception $e) {}
-                        try {
-                            $table->dropUnique('kb_id');
-                        } catch (\Exception $e) {}
-                        try {
-                            $table->dropUnique('mod_multibrand_kb_brands_article_id_unique');
-                        } catch (\Exception $e) {}
-                        try {
-                            $table->dropUnique('article_id');
-                        } catch (\Exception $e) {}
-                        try {
-                            $table->unique(['article_id', 'brand_id']);
-                        } catch (\Exception $e) {}
-                    });
                 } catch (\Exception $e) {}
-            }
-        } else {
-            try {
-                Capsule::schema()->create('mod_multibrand_kb_brands', function ($table) {
-                    $table->increments('id');
-                    $table->integer('article_id');
-                    $table->integer('brand_id');
-                    $table->timestamps();
-                    $table->unique(['article_id', 'brand_id']);
-                });
-            } catch (\Exception $e) {}
-        }
+           
 
         // Dynamically migrate mod_multibrand_download_brands to update unique index to composite unique key
         if (Capsule::schema()->hasTable('mod_multibrand_download_brands')) {
@@ -587,10 +525,10 @@ class Controller
         $emailTemplatesHtml .= '</div>';
         
         // Add save configuration button at the bottom of the templates list
-        $emailTemplatesHtml .= '
-        <div style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #eee; text-align: right;">
-            <button type="submit" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; font-weight: bold; padding: 8px 20px; font-size: 0.95em;"><i class="fas fa-save" style="margin-right: 6px;"></i> Save Configuration</button>
-        </div>';
+        // $emailTemplatesHtml .= '
+        // <div style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #eee; text-align: right;">
+        //     <button type="submit" class="btn btn-success" style="background-color: #5cb85c; border-color: #4cae4c; font-weight: bold; padding: 8px 20px; font-size: 0.95em;"><i class="fas fa-save" style="margin-right: 6px;"></i> Save Configuration</button>
+        // </div>';
 
         // Fetch all WHMCS clients for the Assign Client modal dropdown
         $allClients = [];
@@ -821,15 +759,19 @@ class Controller
                 ->get();
         } catch (\Exception $e) {}
 
-        // Fetch explicitly assigned addons for this brand
+        // Fetch assigned addons for this brand (explicitly assigned or inheriting parent service brand)
         $assignedAddons = [];
         try {
             $assignedAddons = Capsule::table('tblhostingaddons')
-                ->join('tblhosting', 'tblhostingaddons.hostingid', '=', 'tblhosting.id')
-                ->join('tblclients', 'tblhosting.userid', '=', 'tblclients.id')
+                ->leftJoin('tblhosting', 'tblhostingaddons.hostingid', '=', 'tblhosting.id')
+                ->join('tblclients', 'tblhostingaddons.userid', '=', 'tblclients.id')
                 ->leftJoin('tbladdons', 'tblhostingaddons.addonid', '=', 'tbladdons.id')
                 ->join('mod_multibrand_addon_brands', 'tblhostingaddons.id', '=', 'mod_multibrand_addon_brands.addon_id')
-                ->where('mod_multibrand_addon_brands.brand_id', $brand->id)
+                ->leftJoin('mod_multibrand_service_brands', 'tblhostingaddons.hostingid', '=', 'mod_multibrand_service_brands.service_id')
+                ->where(function($q) use ($brand) {
+                    $q->where('mod_multibrand_addon_brands.brand_id', $brand->id)
+                      ->orWhere('mod_multibrand_service_brands.brand_id', $brand->id);
+                })
                 ->select(
                     'tblhostingaddons.*',
                     'tbladdons.name as addon_name',
@@ -889,10 +831,14 @@ class Controller
             }
 
             $quotes = Capsule::table('tblquotes')
-                ->join('tblclients', 'tblquotes.userid', '=', 'tblclients.id')
+                ->leftJoin('tblclients', 'tblquotes.userid', '=', 'tblclients.id')
                 ->join('mod_multibrand_quote_brands', 'tblquotes.id', '=', 'mod_multibrand_quote_brands.quote_id')
                 ->where('mod_multibrand_quote_brands.brand_id', $brand->id)
-                ->select('tblquotes.*', 'tblclients.firstname', 'tblclients.lastname')
+                ->select(
+                    'tblquotes.*',
+                    Capsule::raw('COALESCE(tblclients.firstname, tblquotes.firstname) as firstname'),
+                    Capsule::raw('COALESCE(tblclients.lastname, tblquotes.lastname) as lastname')
+                )
                 ->get();
         } catch (\Exception $e) {}
 
@@ -2054,6 +2000,47 @@ class Controller
                                                 saveState();
                                             };
 
+                                            // Test Credentials
+                                            var testCredsRow = document.createElement("div");
+                                            testCredsRow.style.display = "flex";
+                                            testCredsRow.style.flexDirection = "column";
+                                            testCredsRow.style.gap = "8px";
+                                            testCredsRow.style.marginTop = "15px";
+
+                                            testCredsRow.innerHTML = "<span style=\"font-weight: bold; color: #555; font-size: 0.92em;\">Test Gateway Credentials</span>" +
+                                                "<button type=\"button\" id=\"btn_test_gateway\" class=\"btn btn-success btn-sm\" style=\"background-color: #5cb85c; border-color: #4cae4c; padding: 5px 15px; font-weight: 600; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; align-self: flex-start; font-size: 0.88em;\">" +
+                                                "<i class=\"fas fa-plug\"></i> Test Connection" +
+                                                "</button>" +
+                                                "<div id=\"gateway_test_result\" style=\"display: none; margin-top: 5px;\"></div>";
+
+                                            fieldsGrid.appendChild(testCredsRow);
+
+                                            var btnTestGw = testCredsRow.querySelector("#btn_test_gateway");
+                                            btnTestGw.onclick = function() {
+                                                var resultDiv = testCredsRow.querySelector("#gateway_test_result");
+                                                resultDiv.style.display = "block";
+                                                resultDiv.innerHTML = "<div class=\'alert alert-warning\' style=\'margin: 0; padding: 8px 12px; font-size: 0.85em;\'><i class=\'fas fa-spinner fa-spin\'></i> Verifying credentials...</div>";
+
+                                                var clientIdVal = fieldsGrid.querySelector("#gw_client_id") ? fieldsGrid.querySelector("#gw_client_id").value : "";
+                                                var secretVal = fieldsGrid.querySelector("#gw_secret") ? fieldsGrid.querySelector("#gw_secret").value : "";
+                                                var testModeVal = gw.test_mode;
+
+                                                jQuery.post("' . $modulelink . '&action=test_gateway_connection", {
+                                                    gateway: gw.gateway,
+                                                    client_id: clientIdVal,
+                                                    secret: secretVal,
+                                                    test_mode: testModeVal
+                                                }, function(res) {
+                                                    if (res.success) {
+                                                        resultDiv.innerHTML = "<div class=\'alert alert-success\' style=\'margin: 0; padding: 8px 12px; font-size: 0.85em;\'><i class=\'fas fa-check-circle\'></i> " + res.message + "</div>";
+                                                    } else {
+                                                        resultDiv.innerHTML = "<div class=\'alert alert-danger\' style=\'margin: 0; padding: 8px 12px; font-size: 0.85em;\'><i class=\'fas fa-exclamation-circle\'></i> " + res.message + "</div>";
+                                                    }
+                                                }, "json").fail(function() {
+                                                    resultDiv.innerHTML = "<div class=\'alert alert-danger\' style=\'margin: 0; padding: 8px 12px; font-size: 0.85em;\'><i class=\'fas fa-exclamation-circle\'></i> AJAX request failed. Make sure your server is reachable.</div>";
+                                                });
+                                            };
+
                                             formContainer.appendChild(fieldsGrid);
                                         }
 
@@ -2348,8 +2335,9 @@ class Controller
                         </div>
                         
                         <div style="padding: 15px 25px; background: #fafafa; border-top: 1px solid #f0f0f0; text-align: right;">
-                                        <button type="submit" class="btn btn-success" style="padding: 7px 25px; font-weight: 600; border-radius: 4px;"><i class="fas fa-save" style="margin-right: 6px;"></i> Save Changes</button>
+                                        <button type="submit" class="btn btn-success btn-sm" style="padding: 5px 20px; font-weight: 600; border-radius: 4px; font-size: 0.88em;"><i class="fas fa-save" style="margin-right: 6px;"></i> Save Changes</button>
                         </div>
+                        
                     </div>
                 </div>
                 
@@ -5496,6 +5484,52 @@ class Controller
     {
         $id = isset($_POST['id']) ? (int) $_POST['id'] : 0;
 
+        $domain = isset($_POST['domain']) ? trim($_POST['domain']) : '';
+        $systemUrl = isset($_POST['system_url']) ? trim($_POST['system_url']) : '';
+        $tosUrl = isset($_POST['tos_url']) ? trim($_POST['tos_url']) : '';
+
+        // Validate Domain URL (Required, must be a valid URL starting with http:// or https://)
+        if (empty($domain)) {
+            $validationError = 'Domain is required.';
+        } elseif (!filter_var($domain, FILTER_VALIDATE_URL) || !preg_match('/^https?:\/\//i', $domain)) {
+            $validationError = 'Domain must be a valid URL starting with http:// or https://';
+        }
+
+        // Validate System URL (Required, must be a valid URL starting with http:// or https://)
+        if (!isset($validationError)) {
+            if (empty($systemUrl)) {
+                $validationError = 'System URL is required.';
+            } elseif (!filter_var($systemUrl, FILTER_VALIDATE_URL) || !preg_match('/^https?:\/\//i', $systemUrl)) {
+                $validationError = 'System URL must be a valid URL starting with http:// or https://';
+            }
+        }
+
+        // Validate TOS URL (Optional, but if present must be a valid URL starting with http:// or https://)
+        if (!isset($validationError) && !empty($tosUrl)) {
+            if (!filter_var($tosUrl, FILTER_VALIDATE_URL) || !preg_match('/^https?:\/\//i', $tosUrl)) {
+                $validationError = 'TOS URL must be a valid URL starting with http:// or https://';
+            }
+        }
+
+        $_POST['domain'] = $domain;
+
+        // If validation fails, handle redirecting back with errors and input preservation
+        if (isset($validationError)) {
+            echo '<div class="alert alert-danger">Error: ' . htmlspecialchars($validationError) . '</div>';
+            $_REQUEST['validation_error'] = true;
+            if ($id > 0) {
+                $_REQUEST['id'] = $id;
+                return $this->edit($vars);
+            }
+            return $this->add($vars);
+        }
+
+        // Apply trailing slash to System URL if it does not end with one
+        if (substr($systemUrl, -1) !== '/') {
+            $systemUrl .= '/';
+        }
+        $_POST['system_url'] = $systemUrl;
+
         $isDefault = isset($_POST['is_default']) ? 1 : 0;
         if ($isDefault) {
             Capsule::table('mod_multibrand_brands')->update(['is_default' => 0]);
@@ -5551,8 +5585,10 @@ class Controller
             ]),
             'updated_at' => date('Y-m-d H:i:s'),
         ];
-           if (isset($_POST['next_sequential_number']) && $_POST['next_sequential_number'] !== '') {
+        if (isset($_POST['next_sequential_number']) && $_POST['next_sequential_number'] !== '') {
             $data['next_sequential_number'] = (int) $_POST['next_sequential_number'];
+        } else {
+            $data['next_sequential_number'] = null;
         }
         // Handle Logo Upload
         if (isset($_FILES['logo_upload']) && $_FILES['logo_upload']['name'] != '') {
@@ -5756,6 +5792,165 @@ class Controller
         } catch (\Exception $e) {
             echo json_encode(['success' => false, 'message' => 'Connection failed: ' . $e->getMessage()]);
         }
+        exit;
+    }
+
+    /**
+     * Test payment gateway credentials via AJAX
+     */
+    public function test_gateway_connection($vars)
+    {
+        header('Content-Type: application/json');
+
+        $gateway = $_POST['gateway'] ?? '';
+        $client_id = $_POST['client_id'] ?? '';
+        $secret = $_POST['secret'] ?? '';
+        $test_mode = isset($_POST['test_mode']) ? (int)$_POST['test_mode'] : 0;
+
+        if (empty($gateway)) {
+            echo json_encode(['success' => false, 'message' => 'Gateway type is required.']);
+            exit;
+        }
+
+        if ($gateway === 'paypal') {
+            if (empty($client_id)) {
+                echo json_encode(['success' => false, 'message' => 'PayPal Email address is required.']);
+                exit;
+            }
+            if (filter_var($client_id, FILTER_VALIDATE_EMAIL)) {
+                echo json_encode(['success' => true, 'message' => 'PayPal Email address is valid.']);
+            } else {
+                echo json_encode(['success' => false, 'message' => 'Invalid PayPal Email address.']);
+            }
+            exit;
+        }
+
+        if ($gateway === 'stripe') {
+            if (empty($client_id)) {
+                echo json_encode(['success' => false, 'message' => 'Publishable Key is required.']);
+                exit;
+            }
+            if (empty($secret)) {
+                echo json_encode(['success' => false, 'message' => 'Secret Key is required.']);
+                exit;
+            }
+
+            // 1. Validate mode matching for Publishable Key
+            $isTestPub = (strpos($client_id, 'pk_test_') === 0);
+            if ($test_mode && !$isTestPub) {
+                echo json_encode(['success' => false, 'message' => 'Stripe is set to Test Mode, but a Live Publishable Key was provided.']);
+                exit;
+            }
+            if (!$test_mode && $isTestPub) {
+                echo json_encode(['success' => false, 'message' => 'Stripe is set to Live Mode, but a Test Publishable Key was provided.']);
+                exit;
+            }
+
+            // 2. Verify Stripe Publishable Key via Stripe API tokens endpoint
+            $ch = curl_init();
+            curl_setopt($ch, CURLOPT_URL, 'https://api.stripe.com/v1/tokens');
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                'Authorization: Bearer ' . $client_id
+            ]);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+            $pubResponse = curl_exec($ch);
+            if (curl_errno($ch)) {
+                $error_msg = curl_error($ch);
+                curl_close($ch);
+                echo json_encode(['success' => false, 'message' => 'Stripe Publishable Key connection failed: ' . $error_msg]);
+                exit;
+            }
+            $pubHttpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            $pubResData = json_decode($pubResponse, true);
+            // If the key is invalid, Stripe returns 401 Unauthorized
+            if ($pubHttpCode === 401) {
+                $pubErrMsg = $pubResData['error']['message'] ?? 'Invalid Publishable Key.';
+                echo json_encode(['success' => false, 'message' => 'Stripe Publishable Key verification failed: ' . $pubErrMsg]);
+                exit;
+            }
+
+            // 3. Validate mode matching for Secret Key
+            $isTestKey = (strpos($secret, 'sk_test_') === 0 || strpos($secret, 'rk_test_') === 0);
+            if ($test_mode && !$isTestKey) {
+                echo json_encode(['success' => false, 'message' => 'Stripe is set to Test Mode, but a Live Secret Key was provided.']);
+                exit;
+            }
+            if (!$test_mode && $isTestKey) {
+                echo json_encode(['success' => false, 'message' => 'Stripe is set to Live Mode, but a Test Secret Key was provided.']);
+                exit;
+            }
+
+            // 4. Verify Stripe Secret Key via Stripe API balance endpoint
+            $ch = curl_init();
+            curl_setopt($ch, CURLOPT_URL, 'https://api.stripe.com/v1/balance');
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                'Authorization: Bearer ' . $secret
+            ]);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+            $response = curl_exec($ch);
+            if (curl_errno($ch)) {
+                $error_msg = curl_error($ch);
+                curl_close($ch);
+                echo json_encode(['success' => false, 'message' => 'Stripe Secret Key connection failed: ' . $error_msg]);
+                exit;
+            }
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            $resData = json_decode($response, true);
+            if ($httpCode === 200) {
+                echo json_encode(['success' => true, 'message' => 'Stripe credentials (both Publishable and Secret Keys) are valid and connection was successful!']);
+            } else {
+                $errMsg = $resData['error']['message'] ?? 'Invalid Secret Key or API request failed.';
+                echo json_encode(['success' => false, 'message' => 'Stripe Secret Key verification failed: ' . $errMsg]);
+            }
+            exit;
+        }
+
+        if ($gateway === 'paypalrest') {
+            if (empty($client_id) || empty($secret)) {
+                echo json_encode(['success' => false, 'message' => 'Client ID and Secret are required.']);
+                exit;
+            }
+
+            $url = $test_mode ? 'https://api-m.sandbox.paypal.com/v1/oauth2/token' : 'https://api-m.paypal.com/v1/oauth2/token';
+            $ch = curl_init();
+            curl_setopt($ch, CURLOPT_URL, $url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, 'grant_type=client_credentials');
+            curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                'Accept: application/json',
+                'Accept-Language: en_US',
+                'Authorization: Basic ' . base64_encode($client_id . ':' . $secret)
+            ]);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+            $response = curl_exec($ch);
+            if (curl_errno($ch)) {
+                $error_msg = curl_error($ch);
+                curl_close($ch);
+                echo json_encode(['success' => false, 'message' => 'PayPal REST connection failed: ' . $error_msg]);
+                exit;
+            }
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            $resData = json_decode($response, true);
+            if ($httpCode === 200 && !empty($resData['access_token'])) {
+                echo json_encode(['success' => true, 'message' => 'PayPal REST credentials are valid and connection was successful!']);
+            } else {
+                $errMsg = $resData['error_description'] ?? $resData['message'] ?? 'Invalid Client ID or Secret.';
+                echo json_encode(['success' => false, 'message' => 'PayPal REST verification failed: ' . $errMsg]);
+            }
+            exit;
+        }
+
+        echo json_encode(['success' => false, 'message' => 'Credential verification is not supported for ' . htmlspecialchars($gateway) . ' gateway.']);
         exit;
     }
 
@@ -6240,7 +6435,14 @@ class Controller
                     }
                     
                     // Map registration/transfer/renewal prices by year
-                    $cycles = ['monthly' => 1, 'quarterly' => 2, 'semiannually' => 3, 'annually' => 4, 'biennially' => 5, 'triennially' => 10];
+                    $cycles = [
+                        'msetupfee' => 1,
+                        'qsetupfee' => 2,
+                        'ssetupfee' => 3,
+                        'asetupfee' => 4,
+                        'bsetupfee' => 5,
+                        'tsetupfee' => 10
+                    ];
                     foreach ($cycles as $col => $year) {
                         if ($bp->type == 'domainregister') {
                             $response['base'][$currId]['register' . $year] = $bp->$col;
@@ -7150,8 +7352,8 @@ class Controller
         } elseif ($type == 'addon') {
             $assignedAddonIds = Capsule::table('mod_multibrand_addon_brands')->pluck('addon_id')->toArray();
             $query = Capsule::table('tblhostingaddons')
-                ->join('tblhosting', 'tblhostingaddons.hostingid', '=', 'tblhosting.id')
-                ->join('tblclients', 'tblhosting.userid', '=', 'tblclients.id')
+                ->leftJoin('tblhosting', 'tblhostingaddons.hostingid', '=', 'tblhosting.id')
+                ->join('tblclients', 'tblhostingaddons.userid', '=', 'tblclients.id')
                 ->leftJoin('tbladdons', 'tblhostingaddons.addonid', '=', 'tbladdons.id');
 
             if (!empty($assignedAddonIds)) {
@@ -7588,7 +7790,7 @@ class Controller
         $assignedQuoteIds = Capsule::table('mod_multibrand_quote_brands')->pluck('quote_id')->toArray();
 
         $query = Capsule::table('tblquotes')
-            ->join('tblclients', 'tblquotes.userid', '=', 'tblclients.id');
+            ->leftJoin('tblclients', 'tblquotes.userid', '=', 'tblclients.id');
 
         if (!empty($assignedQuoteIds)) {
             $query->whereNotIn('tblquotes.id', $assignedQuoteIds);
@@ -7601,7 +7803,10 @@ class Controller
                    ->orWhere('tblquotes.stage', 'like', '%' . $q . '%')
                    ->orWhere('tblclients.firstname', 'like', '%' . $q . '%')
                    ->orWhere('tblclients.lastname', 'like', '%' . $q . '%')
-                   ->orWhere('tblclients.companyname', 'like', '%' . $q . '%');
+                   ->orWhere('tblclients.companyname', 'like', '%' . $q . '%')
+                   ->orWhere('tblquotes.firstname', 'like', '%' . $q . '%')
+                   ->orWhere('tblquotes.lastname', 'like', '%' . $q . '%')
+                   ->orWhere('tblquotes.companyname', 'like', '%' . $q . '%');
             });
         }
 
@@ -7609,13 +7814,16 @@ class Controller
             'tblquotes.id',
             'tblquotes.subject',
             'tblquotes.stage',
-            'tblclients.firstname',
-            'tblclients.lastname'
+            'tblquotes.total',
+            Capsule::raw('COALESCE(tblclients.firstname, tblquotes.firstname) as firstname'),
+            Capsule::raw('COALESCE(tblclients.lastname, tblquotes.lastname) as lastname')
         )->orderBy('tblquotes.id', 'desc')->limit(50)->get();
 
         $results = [];
         foreach ($quotes as $quote) {
-            $text = '#' . $quote->id . ' ' . $quote->stage . ' - ' . $quote->subject;
+            $clientName = trim($quote->firstname . ' ' . $quote->lastname);
+            $clientText = $clientName ? ' - ' . $clientName : '';
+            $text = '#' . $quote->id . ' [' . ($quote->stage ?: 'Draft') . ']' . $clientText . ' - ' . ($quote->subject ?: '(No Subject)') . ' - Total: ' . $quote->total;
             $results[] = [
                 'id' => $quote->id,
                 'text' => $text

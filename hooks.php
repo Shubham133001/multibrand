@@ -14,12 +14,81 @@ include 'multidomain.php';
 
 use WHMCS\Database\Capsule;
 
+if (!class_exists('MultibrandClientAreaAddonWrapper')) {
+    class MultibrandClientAreaAddonWrapper implements \ArrayAccess {
+        private $data = [];
+        public function __construct($data) {
+            $this->data = $data;
+        }
+        public function offsetExists($offset): bool { return isset($this->data[$offset]); }
+        #[\ReturnTypeWillChange]
+        public function offsetGet($offset) {
+            return $this->data[$offset] ?? null;
+        }
+        #[\ReturnTypeWillChange]
+        public function offsetSet($offset, $value) { $this->data[$offset] = $value; }
+        #[\ReturnTypeWillChange]
+        public function offsetUnset($offset) { unset($this->data[$offset]); }
+        public function __get($name) {
+            if ($name === 'product') {
+                return new class($this->data['product']) {
+                    private $name;
+                    public function __construct($name) { $this->name = $name; }
+                    public function __toString() { return $this->name; }
+                    public function __get($prop) {
+                        if ($prop === 'name') return $this->name;
+                        if ($prop === 'productGroup') {
+                            return new class {
+                                public $name = 'Addon';
+                            };
+                        }
+                        return null;
+                    }
+                };
+            }
+            if ($name === 'domainStatus') {
+                return $this->data['status'];
+            }
+            return $this->data[$name] ?? null;
+        }
+        public function __isset($name): bool {
+            if ($name === 'domainStatus') return true;
+            return isset($this->data[$name]);
+        }
+    }
+}
+
+
 // Dynamically create service brands table if missing to ensure seamless upgrades
 try {
     if (!Capsule::schema()->hasTable('mod_multibrand_service_brands')) {
         Capsule::schema()->create('mod_multibrand_service_brands', function ($table) {
             $table->increments('id');
             $table->integer('service_id')->unique();
+            $table->integer('brand_id');
+            $table->timestamps();
+        });
+    }
+} catch (\Exception $e) {}
+
+// Dynamically create addon brands table if missing to ensure seamless upgrades
+try {
+    if (!Capsule::schema()->hasTable('mod_multibrand_addon_brands')) {
+        Capsule::schema()->create('mod_multibrand_addon_brands', function ($table) {
+            $table->increments('id');
+            $table->integer('addon_id')->unique();
+            $table->integer('brand_id');
+            $table->timestamps();
+        });
+    }
+} catch (\Exception $e) {}
+
+// Dynamically create domain brands table if missing to ensure seamless upgrades
+try {
+    if (!Capsule::schema()->hasTable('mod_multibrand_domain_brands')) {
+        Capsule::schema()->create('mod_multibrand_domain_brands', function ($table) {
+            $table->increments('id');
+            $table->integer('domain_id')->unique();
             $table->integer('brand_id');
             $table->timestamps();
         });
@@ -72,7 +141,7 @@ if (isset($_POST['multibrand_id'])) {
     $scriptFilenameClean = str_replace('.php', '', $scriptFilename);
 
     // Only process for specific admin files
-    $supportedFiles = ['invoices', 'supportannouncements', 'supportdownloads', 'orders', 'ordersadd', 'ordersedit', 'clientsservices', 'supporttickets'];
+    $supportedFiles = ['invoices', 'supportannouncements', 'supportdownloads', 'orders', 'ordersadd', 'ordersedit', 'clientsservices', 'supporttickets', 'clientsdomains'];
 
     if (in_array($scriptFilenameClean, $supportedFiles)) {
         try {
@@ -132,6 +201,20 @@ if (isset($_POST['multibrand_id'])) {
                         }
                     }
                 }
+            } elseif ($scriptFilenameClean == 'clientsdomains') {
+                $domainId = (int)($_REQUEST['id'] ?? $_POST['id'] ?? 0);
+                if ($domainId > 0) {
+                    if ($brandId === 0) {
+                        Capsule::table('mod_multibrand_domain_brands')->where('domain_id', $domainId)->delete();
+                    } else {
+                        $exists = Capsule::table('mod_multibrand_domain_brands')->where('domain_id', $domainId)->exists();
+                        if ($exists) {
+                            Capsule::table('mod_multibrand_domain_brands')->where('domain_id', $domainId)->update(['brand_id' => $brandId, 'updated_at' => date('Y-m-d H:i:s')]);
+                        } else {
+                            Capsule::table('mod_multibrand_domain_brands')->insert(['domain_id' => $domainId, 'brand_id' => $brandId, 'created_at' => date('Y-m-d H:i:s'), 'updated_at' => date('Y-m-d H:i:s')]);
+                        }
+                    }
+                }
             } elseif (in_array($scriptFilenameClean, ['ordersedit', 'orders'])) {
                 $orderId = (int)($_REQUEST['id'] ?? $_REQUEST['orderid'] ?? $_POST['id'] ?? $_POST['orderid'] ?? 0);
                 if ($orderId > 0) {
@@ -188,6 +271,34 @@ if (isset($_POST['multibrand_id'])) {
                                             ]);
                                         }
                                     }
+
+                                    // Save addon brand for each addon in the order
+                                    $addons = Capsule::table('tblhostingaddons')->where('orderid', $orderId)->get();
+                                    foreach ($addons as $addon) {
+                                        $addonExists = Capsule::table('mod_multibrand_addon_brands')->where('addon_id', $addon->id)->exists();
+                                        if (!$addonExists) {
+                                            Capsule::table('mod_multibrand_addon_brands')->insert([
+                                                'addon_id' => $addon->id,
+                                                'brand_id' => $brandId,
+                                                'created_at' => date('Y-m-d H:i:s'),
+                                                'updated_at' => date('Y-m-d H:i:s')
+                                            ]);
+                                        }
+                                    }
+
+                                    // Save domain brand for each domain in the order
+                                    $domains = Capsule::table('tbldomains')->where('orderid', $orderId)->get();
+                                    foreach ($domains as $domain) {
+                                        $domainExists = Capsule::table('mod_multibrand_domain_brands')->where('domain_id', $domain->id)->exists();
+                                        if (!$domainExists) {
+                                            Capsule::table('mod_multibrand_domain_brands')->insert([
+                                                'domain_id' => $domain->id,
+                                                'brand_id' => $brandId,
+                                                'created_at' => date('Y-m-d H:i:s'),
+                                                'updated_at' => date('Y-m-d H:i:s')
+                                            ]);
+                                        }
+                                    }
                                 }
                             }
                         } catch (\Exception $e) {}
@@ -198,6 +309,61 @@ if (isset($_POST['multibrand_id'])) {
             // Ignore DB errors on early intercept
         }
     }
+}
+
+/**
+ * Checks if the current request domain belongs to a brand that is disabled.
+ * Returns true if a brand matches the request domain and is disabled (status = 0).
+ */
+if (!function_exists('is_multibrand_request_domain_disabled')) {
+function is_multibrand_request_domain_disabled()
+{
+    if (!isset($_SERVER['SERVER_NAME'])) {
+        return false;
+    }
+    $requestHost = strtolower($_SERVER['SERVER_NAME']);
+    $requestHostClean = ltrim($requestHost, 'www.');
+
+    try {
+        $brands = Capsule::table('mod_multibrand_brands')->get();
+
+        // Exact/clean hostname match first
+        foreach ($brands as $brand) {
+            $brandUrl = $brand->domain;
+            if ($brandUrl) {
+                if (strpos($brandUrl, '://') === false) {
+                    $brandUrl = 'http://' . $brandUrl;
+                }
+                $brandHost = strtolower(parse_url($brandUrl, PHP_URL_HOST));
+                $brandHostClean = ltrim($brandHost, 'www.');
+
+                if ($requestHostClean === $brandHostClean) {
+                    return $brand->status == 0;
+                }
+            }
+        }
+
+        // Substring hostname match next
+        foreach ($brands as $brand) {
+            $brandUrl = $brand->domain;
+            if ($brandUrl) {
+                if (strpos($brandUrl, '://') === false) {
+                    $brandUrl = 'http://' . $brandUrl;
+                }
+                $brandHost = strtolower(parse_url($brandUrl, PHP_URL_HOST));
+                $brandHostClean = ltrim($brandHost, 'www.');
+
+                if ($brandHostClean !== '' && (strpos($brandHostClean, $requestHostClean) !== false || strpos($requestHostClean, $brandHostClean) !== false)) {
+                    return $brand->status == 0;
+                }
+            }
+        }
+    } catch (\Exception $e) {
+        // Ignore DB errors
+    }
+
+    return false;
+}
 }
 
 /**
@@ -346,6 +512,259 @@ function get_multibrand_brand_by_domain()
     }
 
     return null;
+}
+}
+
+/**
+ * Override renewal prices in the cart based on brand pricing overrides
+ */
+if (!function_exists('override_renewal_prices_in_cart')) {
+function override_renewal_prices_in_cart(&$vars)
+{
+    $log = [];
+    $log[] = "=== override_renewal_prices_in_cart ===";
+    $log[] = "Time: " . date('Y-m-d H:i:s');
+    $log[] = "URI: " . ($_SERVER['REQUEST_URI'] ?? '');
+    $log[] = "Vars Keys: " . implode(', ', array_keys($vars));
+    if (isset($vars['templatefile'])) {
+        $log[] = "templatefile: " . $vars['templatefile'];
+    }
+
+    try {
+        $brand = get_multibrand_active_brand();
+        $log[] = "Brand: " . ($brand ? $brand->brand_name . " (ID: {$brand->id})" : "null");
+        if (!$brand || !$brand->price_override) {
+            $log[] = "Exit: No brand or price_override disabled";
+            file_put_contents(__DIR__ . '/renewal_override_debug.log', implode("\n", $log) . "\n\n", FILE_APPEND);
+            return;
+        }
+
+        $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+        $log[] = "pricing_overrides domains keys: " . json_encode(array_keys($pricingOverrides['domains'] ?? []));
+        if (empty($pricingOverrides['domains'])) {
+            $log[] = "Exit: No domain pricing overrides";
+            file_put_contents(__DIR__ . '/renewal_override_debug.log', implode("\n", $log) . "\n\n", FILE_APPEND);
+            return;
+        }
+
+        $currencyId = isset($vars['activeCurrency']) && is_object($vars['activeCurrency']) ? (int)$vars['activeCurrency']->id : (int)($_SESSION['currency'] ?? 0);
+        if ($currencyId <= 0) {
+            $currencyId = (int)Capsule::table('tblcurrencies')->where('default', 1)->value('id') ?: 1;
+        }
+        $log[] = "Currency ID: $currencyId";
+        $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+        if (!$currencyObj) {
+            $log[] = "Exit: Currency object not found";
+            file_put_contents(__DIR__ . '/renewal_override_debug.log', implode("\n", $log) . "\n\n", FILE_APPEND);
+            return;
+        }
+
+        $changed = false;
+        $diff = 0.0;
+
+        $processDomains = function(&$domains) use ($pricingOverrides, $currencyId, $currencyObj, &$changed, &$diff, &$log) {
+            if (!is_array($domains)) {
+                $log[] = "processDomains: domains is not an array";
+                return;
+            }
+            $log[] = "processDomains: domain keys: " . json_encode(array_keys($domains));
+            foreach ($domains as $domainId => $renewal) {
+                $domainName = '';
+                if (is_array($renewal)) {
+                    $domainName = $renewal['domain'] ?? '';
+                    $log[] = "processDomains item $domainId (array): domain=$domainName";
+                } elseif (is_object($renewal)) {
+                    $domainName = $renewal->domain ?? '';
+                    $log[] = "processDomains item $domainId (object): domain=$domainName";
+                }
+
+                if (!$domainName || strpos($domainName, '.') === false) {
+                    $log[] = "processDomains item $domainId: invalid domain name";
+                    continue;
+                }
+
+                $dotPos = strpos($domainName, '.');
+                $tld = substr($domainName, $dotPos);
+                $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $tld)->first();
+                if (!$domainTemplate) {
+                    $log[] = "processDomains item $domainId: no domain template for TLD $tld";
+                    continue;
+                }
+
+                $domainIdDb = $domainTemplate->id;
+                $domainOverrides = $pricingOverrides['domains'][$domainIdDb]['pricing'] ?? [];
+                if (empty($domainOverrides)) {
+                    $log[] = "processDomains item $domainId: no brand pricing overrides for domain template ID $domainIdDb";
+                    continue;
+                }
+
+                $rates = $domainOverrides[$currencyId] ?? [];
+                if (empty($rates)) {
+                    $log[] = "processDomains item $domainId: empty rates for currency $currencyId";
+                    continue;
+                }
+
+                $regperiod = 1;
+                if (is_array($renewal)) {
+                    $regperiod = (int)($renewal['regperiod'] ?? 1);
+                } elseif (is_object($renewal)) {
+                    $regperiod = (int)($renewal->regperiod ?? 1);
+                }
+
+                $renewKey = 'renew' . $regperiod;
+                if (isset($rates[$renewKey]) && $rates[$renewKey] !== '' && (float)$rates[$renewKey] >= 0) {
+                    $newPrice = (float)$rates[$renewKey];
+
+                    $oldPrice = 0.0;
+                    if (is_array($renewal)) {
+                        if (isset($renewal['priceBeforeTax']) && is_object($renewal['priceBeforeTax']) && method_exists($renewal['priceBeforeTax'], 'toNumeric')) {
+                            $oldPrice = (float)$renewal['priceBeforeTax']->toNumeric();
+                        } elseif (isset($renewal['priceBeforeTax'])) {
+                            $oldPrice = (float)$renewal['priceBeforeTax'];
+                        }
+                    } elseif (is_object($renewal)) {
+                        if (isset($renewal->priceBeforeTax) && is_object($renewal->priceBeforeTax) && method_exists($renewal->priceBeforeTax, 'toNumeric')) {
+                            $oldPrice = (float)$renewal->priceBeforeTax->toNumeric();
+                        } elseif (isset($renewal->priceBeforeTax)) {
+                            $oldPrice = (float)$renewal->priceBeforeTax;
+                        }
+                    }
+
+                    $log[] = "processDomains item $domainId: regperiod=$regperiod, oldPrice=$oldPrice, newPrice=$newPrice";
+
+                    if ($newPrice != $oldPrice) {
+                        $diff += ($newPrice - $oldPrice);
+                        $changed = true;
+
+                        $priceObj = new \WHMCS\View\Formatter\Price($newPrice, $currencyObj);
+                        if (is_array($renewal)) {
+                            $domains[$domainId]['priceBeforeTax'] = $priceObj;
+                            $domains[$domainId]['price'] = $priceObj;
+                            if (isset($renewal['priceBeforeTaxFormatted'])) {
+                                $domains[$domainId]['priceBeforeTaxFormatted'] = formatCurrency($newPrice, $currencyId);
+                            }
+                        } elseif (is_object($renewal)) {
+                            $renewal->priceBeforeTax = $priceObj;
+                            $renewal->price = $priceObj;
+                            if (isset($renewal->priceBeforeTaxFormatted)) {
+                                $renewal->priceBeforeTaxFormatted = formatCurrency($newPrice, $currencyId);
+                            }
+                            $domains[$domainId] = $renewal;
+                        }
+                        $log[] = "processDomains item $domainId: OVERRIDDEN successfully";
+                    }
+                } else {
+                    $log[] = "processDomains item $domainId: no brand rate for key $renewKey";
+                }
+            }
+        };
+
+        // 1. Process carttotals
+        if (isset($vars['carttotals']) && is_array($vars['carttotals'])) {
+            $log[] = "Processing carttotals...";
+            $carttotals = $vars['carttotals'];
+            if (isset($carttotals['renewalsByType']['domains'])) {
+                $processDomains($carttotals['renewalsByType']['domains']);
+            } else {
+                $log[] = "carttotals['renewalsByType']['domains'] is not set";
+            }
+
+            if ($changed && $diff != 0) {
+                // Update subtotal
+                $subtotalVal = 0.0;
+                if (isset($carttotals['subtotal']) && is_object($carttotals['subtotal']) && method_exists($carttotals['subtotal'], 'toNumeric')) {
+                    $subtotalVal = (float)$carttotals['subtotal']->toNumeric();
+                }
+                $subtotalVal += $diff;
+                $carttotals['subtotal'] = new \WHMCS\View\Formatter\Price($subtotalVal, $currencyObj);
+
+                // Recalculate tax and total if tax is set
+                $taxrate = isset($carttotals['taxrate']) ? (float)$carttotals['taxrate'] : 0.0;
+                $taxrate2 = isset($carttotals['taxrate2']) ? (float)$carttotals['taxrate2'] : 0.0;
+
+                $taxtotal = 0.0;
+                $taxtotal2 = 0.0;
+
+                if ($taxrate > 0) {
+                    $taxtotal = round($subtotalVal * ($taxrate / 100), 2);
+                    $carttotals['taxtotal'] = new \WHMCS\View\Formatter\Price($taxtotal, $currencyObj);
+                }
+                if ($taxrate2 > 0) {
+                    $taxtotal2 = round($subtotalVal * ($taxrate2 / 100), 2);
+                    $carttotals['taxtotal2'] = new \WHMCS\View\Formatter\Price($taxtotal2, $currencyObj);
+                }
+
+                $totalVal = $subtotalVal + $taxtotal + $taxtotal2;
+                $carttotals['total'] = new \WHMCS\View\Formatter\Price($totalVal, $currencyObj);
+
+                $vars['carttotals'] = $carttotals;
+                $GLOBALS['smarty']->assign('carttotals', $carttotals);
+                $log[] = "carttotals updated: subtotal=$subtotalVal, total=$totalVal";
+            }
+        } else {
+            $log[] = "vars['carttotals'] is not set";
+        }
+
+        // 2. Process renewalsByType
+        if (isset($vars['renewalsByType']['domains'])) {
+            $log[] = "Processing renewalsByType...";
+            $renewalsByType = $vars['renewalsByType'];
+            $processDomains($renewalsByType['domains']);
+            $vars['renewalsByType'] = $renewalsByType;
+            $GLOBALS['smarty']->assign('renewalsByType', $renewalsByType);
+            $log[] = "renewalsByType updated";
+        } else {
+            $log[] = "vars['renewalsByType']['domains'] is not set";
+        }
+
+        if ($changed && $diff != 0) {
+            if (isset($vars['subtotal'])) {
+                $subtotalVal = 0.0;
+                if (is_object($vars['subtotal']) && method_exists($vars['subtotal'], 'toNumeric')) {
+                    $subtotalVal = (float)$vars['subtotal']->toNumeric();
+                }
+                $subtotalVal += $diff;
+                $vars['subtotal'] = new \WHMCS\View\Formatter\Price($subtotalVal, $currencyObj);
+                $GLOBALS['smarty']->assign('subtotal', $vars['subtotal']);
+                $log[] = "vars['subtotal'] updated: $subtotalVal";
+            }
+
+            if (isset($vars['total'])) {
+                $totalVal = 0.0;
+                if (is_object($vars['total']) && method_exists($vars['total'], 'toNumeric')) {
+                    $totalVal = (float)$vars['total']->toNumeric();
+                }
+                $totalVal += $diff;
+
+                $taxrate = isset($vars['taxrate']) ? (float)$vars['taxrate'] : 0.0;
+                $taxrate2 = isset($vars['taxrate2']) ? (float)$vars['taxrate2'] : 0.0;
+                if ($taxrate > 0 || $taxrate2 > 0) {
+                    $subtotalVal = isset($vars['subtotal']) && is_object($vars['subtotal']) ? (float)$vars['subtotal']->toNumeric() : 0.0;
+                    $taxtotal = 0.0;
+                    $taxtotal2 = 0.0;
+                    if ($taxrate > 0) {
+                        $taxtotal = round($subtotalVal * ($taxrate / 100), 2);
+                        $vars['taxtotal'] = new \WHMCS\View\Formatter\Price($taxtotal, $currencyObj);
+                        $GLOBALS['smarty']->assign('taxtotal', $vars['taxtotal']);
+                    }
+                    if ($taxrate2 > 0) {
+                        $taxtotal2 = round($subtotalVal * ($taxrate2 / 100), 2);
+                        $vars['taxtotal2'] = new \WHMCS\View\Formatter\Price($taxtotal2, $currencyObj);
+                        $GLOBALS['smarty']->assign('taxtotal2', $vars['taxtotal2']);
+                    }
+                    $totalVal = $subtotalVal + $taxtotal + $taxtotal2;
+                }
+
+                $vars['total'] = new \WHMCS\View\Formatter\Price($totalVal, $currencyObj);
+                $GLOBALS['smarty']->assign('total', $vars['total']);
+                $log[] = "vars['total'] updated: $totalVal";
+            }
+        }
+    } catch (\Exception $e) {
+        $log[] = "EXCEPTION: " . $e->getMessage() . "\n" . $e->getTraceAsString();
+    }
+
+    file_put_contents(__DIR__ . '/renewal_override_debug.log', implode("\n", $log) . "\n\n", FILE_APPEND);
 }
 }
 
@@ -511,23 +930,46 @@ function get_multibrand_client_stats($clientId, $brandId)
                 ->where('tblhosting.domainstatus', 'Active')
                 ->count();
 
+            $activeAddonsCount = (int)Capsule::table('tblhostingaddons')
+                ->Join('mod_multibrand_addon_brands', 'tblhostingaddons.id', '=', 'mod_multibrand_addon_brands.addon_id')
+                ->leftJoin('mod_multibrand_service_brands', 'tblhostingaddons.hostingid', '=', 'mod_multibrand_service_brands.service_id')
+                ->where('tblhostingaddons.userid', $clientId)
+                ->where('tblhostingaddons.status', 'Active')
+                ->where(function($q) use ($brandId) {
+                    $q->where('mod_multibrand_addon_brands.brand_id', $brandId)
+                      ->orWhere('mod_multibrand_service_brands.brand_id', $brandId);
+                })
+                ->count();
+            $activeServices += $activeAddonsCount;
+
             $totalServices = (int)Capsule::table('tblhosting')
                 ->join('mod_multibrand_service_brands', 'tblhosting.id', '=', 'mod_multibrand_service_brands.service_id')
                 ->where('tblhosting.userid', $clientId)
                 ->where('mod_multibrand_service_brands.brand_id', $brandId)
                 ->count();
 
-            $activeDomains = (int)Capsule::table('tbldomains')
-                ->join('mod_multibrand_order_brands', 'tbldomains.orderid', '=', 'mod_multibrand_order_brands.order_id')
-                ->where('tbldomains.userid', $clientId)
-                ->where('mod_multibrand_order_brands.brand_id', $brandId)
-                ->where('tbldomains.status', 'Active')
+            $totalAddonsCount = (int)Capsule::table('tblhostingaddons')
+                ->Join('mod_multibrand_addon_brands', 'tblhostingaddons.id', '=', 'mod_multibrand_addon_brands.addon_id')
+                ->leftJoin('mod_multibrand_service_brands', 'tblhostingaddons.hostingid', '=', 'mod_multibrand_service_brands.service_id')
+                ->where('tblhostingaddons.userid', $clientId)
+                ->where(function($q) use ($brandId) {
+                    $q->where('mod_multibrand_addon_brands.brand_id', $brandId)
+                      ->orWhere('mod_multibrand_service_brands.brand_id', $brandId);
+                })
                 ->count();
+            $totalServices += $totalAddonsCount;
+
+            $activeDomains = (int)Capsule::table('tbldomains')
+            ->join('mod_multibrand_domain_brands', 'tbldomains.id', '=', 'mod_multibrand_domain_brands.domain_id')
+            ->where('tbldomains.userid', $clientId)
+            ->where('mod_multibrand_domain_brands.brand_id', $brandId)
+            ->where('tbldomains.status', 'Active')
+            ->count();
 
             $totalDomains = (int)Capsule::table('tbldomains')
-                ->join('mod_multibrand_order_brands', 'tbldomains.orderid', '=', 'mod_multibrand_order_brands.order_id')
+                ->join('mod_multibrand_domain_brands', 'tbldomains.id', '=', 'mod_multibrand_domain_brands.domain_id')
                 ->where('tbldomains.userid', $clientId)
-                ->where('mod_multibrand_order_brands.brand_id', $brandId)
+                ->where('mod_multibrand_domain_brands.brand_id', $brandId)
                 ->count();
 
             $unpaidInvoices = (int)Capsule::table('tblinvoices')
@@ -582,9 +1024,31 @@ function get_multibrand_client_stats($clientId, $brandId)
  */
 add_hook('ClientAreaPage', 1, function ($vars) {
     try {
+        if (is_multibrand_request_domain_disabled()) {
+            header('HTTP/1.1 403 Forbidden');
+            die('<div style="text-align:center; margin-top:50px; font-family: sans-serif;"><h1>This brand is currently disabled.</h1><p>The domain you are trying to access is associated with a brand that is not active at this time. Please contact the administrator for further details.</p></div>');
+        }
+        if (isset($vars['templatefile'])) {
+            file_put_contents(__DIR__ . '/renew_calculate_debug.log', "Template: " . $vars['templatefile'] . " | Filename: " . ($vars['filename'] ?? '') . " | URI: " . ($_SERVER['REQUEST_URI'] ?? '') . "\n", FILE_APPEND);
+        }
         $brand = null;
         $filename = $vars['filename'] ?? '';
         $templatefile = $vars['templatefile'] ?? '';
+        $action = $_GET['action'] ?? '';
+
+        if ($filename == 'clientarea' && $action == 'productdetails' && isset($_GET['id'])) {
+            $idStr = $_GET['id'];
+            if (strpos($idStr, 'a') === 0) {
+                $addonId = (int)substr($idStr, 1);
+                if ($addonId > 0) {
+                    $addon = Capsule::table('tblhostingaddons')->where('id', $addonId)->first();
+                    if ($addon) {
+                        header('Location: clientarea.php?action=productdetails&id=' . $addon->hostingid);
+                        exit;
+                    }
+                }
+            }
+        }
 
         // If viewing a specific HTML invoice, resolve brand dynamically by the invoice
         if ($filename == 'viewinvoice' && isset($_GET['id'])) {
@@ -601,6 +1065,53 @@ add_hook('ClientAreaPage', 1, function ($vars) {
             $brand = get_multibrand_active_brand();
         }
 
+        $loggedInUserId = isset($_SESSION['user_id']) ? (int)$_SESSION['user_id'] : 0;
+        $loggedInClientId = isset($_SESSION['uid']) ? (int)$_SESSION['uid'] : 0;
+
+        if (($loggedInUserId > 0 || $loggedInClientId > 0) && $brand) {
+            if ($brand->auto_client_assignment == 0) {
+                $assignedToCurrent = false;
+
+                if ($loggedInClientId > 0) {
+                    $assignedToCurrent = Capsule::table('mod_multibrand_client_brands')
+                        ->where('client_id', $loggedInClientId)
+                        ->where('brand_id', $brand->id)
+                        ->exists();
+                } else if ($loggedInUserId > 0) {
+                    $userClientIds = Capsule::table('tblusers_clients')
+                        ->where('auth_user_id', $loggedInUserId)
+                        ->pluck('client_id')
+                        ->toArray();
+
+                    if (!empty($userClientIds)) {
+                        $assignedToCurrent = Capsule::table('mod_multibrand_client_brands')
+                            ->whereIn('client_id', $userClientIds)
+                            ->where('brand_id', $brand->id)
+                            ->exists();
+                    }
+                }
+
+                if (!$assignedToCurrent) {
+                    if ($brand->is_default != 1) {
+                        // Log out client/user completely (preserve admin session)
+                        foreach ($_SESSION as $key => $val) {
+                            if ($key !== 'adminId') {
+                                unset($_SESSION[$key]);
+                            }
+                        }
+
+                        header('HTTP/1.1 403 Forbidden');
+                        die('<div style="text-align:center; margin-top:50px; font-family: sans-serif; max-width: 600px; margin-left: auto; margin-right: auto; padding: 30px; border: 1px solid #ddd; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); background-color: #fff;">
+                            <h1 style="color: #d9534f; font-size: 2.2em; margin-bottom: 20px; font-weight: 500;">Access Restricted</h1>
+                            <p style="font-size: 1.15em; font-weight: bold; color: #333; margin-bottom: 20px; line-height: 1.4;">You are not authorized to access this brand\'s client area.</p>
+                            <p style="color: #666; line-height: 1.6; margin-bottom: 30px; font-size: 0.95em;">Your account is associated with a different brand. Please log in using the brand assigned to your account or contact support if you believe this is an error.</p>
+                            <a href="login.php" style="display: inline-block; padding: 10px 20px; background-color: #0275d8; color: #fff; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 0.95em;">Go to Login</a>
+                        </div>');
+                    }
+                }
+            }
+        }
+
         // file_put_contents(__DIR__ . '/requested_filenames.log', "Resolved Brand: " . ($brand ? $brand->brand_name . " (ID: " . $brand->id . ")" : "NONE") . "\n", FILE_APPEND);
         
         $productsType = isset($vars['products']) ? gettype($vars['products']) : 'NOT SET';
@@ -608,6 +1119,92 @@ add_hook('ClientAreaPage', 1, function ($vars) {
         // file_put_contents(__DIR__ . '/requested_filenames.log', "Vars products type: $productsType | productgroups type: $productGroupsType\n", FILE_APPEND);
 
         if ($brand) {
+            if (isset($vars['templatefile']) && $vars['templatefile'] === 'domain-renewals' && $brand->is_default != 1) {
+                $brandDomainIds = Capsule::table('mod_multibrand_domain_brands')
+                    ->where('brand_id', $brand->id)
+                    ->pluck('domain_id')
+                    ->toArray();
+
+                $renewalsData = $vars['renewalsData'] ?? [];
+                $filteredRenewals = [];
+                $hasExpiredDomains = false;
+                $hasDomainsTooEarlyToRenew = false;
+                $hasDomainsInGracePeriod = false;
+
+                foreach ($renewalsData as $domainInfo) {
+                    $domainId = (int)($domainInfo['id'] ?? 0);
+                    if ($domainId > 0 && in_array($domainId, $brandDomainIds)) {
+                        $filteredRenewals[] = $domainInfo;
+                        if (!empty($domainInfo['inGracePeriod'])) {
+                            $hasDomainsInGracePeriod = true;
+                        }
+                        if (!empty($domainInfo['beforeRenewLimit'])) {
+                            $hasDomainsTooEarlyToRenew = true;
+                        }
+                        if (isset($domainInfo['status']) && ($domainInfo['status'] == 'Expired' || $domainInfo['status'] == 'Grace Period (Expired)')) {
+                            $hasExpiredDomains = true;
+                        }
+                    }
+                }
+
+                $renewalsData = $filteredRenewals;
+                $totalResults = count($renewalsData);
+
+                if ($brand->price_override) {
+                    try {
+                        $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+                        if (!empty($pricingOverrides['domains'])) {
+                            $currencyId = isset($vars['activeCurrency']) && is_object($vars['activeCurrency']) ? (int)$vars['activeCurrency']->id : (int)($_SESSION['currency'] ?? 0);
+                            if ($currencyId <= 0) {
+                                $currencyId = (int)Capsule::table('tblcurrencies')->where('default', 1)->value('id') ?: 1;
+                            }
+                            $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+
+                            if ($currencyObj) {
+                                foreach ($renewalsData as $i => $domainInfo) {
+                                    $tld = $domainInfo['tld'] ?? '';
+                                    if (empty($tld) && !empty($domainInfo['domain']) && strpos($domainInfo['domain'], '.') !== false) {
+                                        $tld = substr($domainInfo['domain'], strpos($domainInfo['domain'], '.'));
+                                    }
+                                    if (!$tld) continue;
+
+                                    $cleanTld = '.' . ltrim($tld, '.');
+                                    $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $cleanTld)->first();
+                                    if (!$domainTemplate) continue;
+
+                                    $domainId = $domainTemplate->id;
+                                    $domainOverrides = $pricingOverrides['domains'][$domainId]['pricing'] ?? [];
+                                    if (empty($domainOverrides)) continue;
+
+                                    $rates = $domainOverrides[$currencyId] ?? [];
+                                    if (empty($rates)) continue;
+
+                                    if (isset($domainInfo['renewalOptions']) && is_array($domainInfo['renewalOptions'])) {
+                                        foreach ($domainInfo['renewalOptions'] as $j => $option) {
+                                            $period = (int)($option['period'] ?? 1);
+                                            $renewKey = 'renew' . $period;
+                                            if (isset($rates[$renewKey]) && $rates[$renewKey] !== '' && (float)$rates[$renewKey] >= 0) {
+                                                $newPrice = (float)$rates[$renewKey];
+                                                $priceObj = new \WHMCS\View\Formatter\Price($newPrice, $currencyObj);
+                                                $renewalsData[$i]['renewalOptions'][$j]['rawRenewalPrice'] = $priceObj;
+                                                $renewalsData[$i]['renewalOptions'][$j]['price'] = $priceObj;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (\Exception $e) {}
+                }
+
+                $overrides['renewalsData'] = $renewalsData;
+                $overrides['totalResults'] = $totalResults;
+                $overrides['totalDomainCount'] = $totalResults;
+                $overrides['hasExpiredDomains'] = $hasExpiredDomains;
+                $overrides['hasDomainsTooEarlyToRenew'] = $hasDomainsTooEarlyToRenew;
+                $overrides['hasDomainsInGracePeriod'] = $hasDomainsInGracePeriod;
+            }
+            override_renewal_prices_in_cart($vars);
             // file_put_contents(__DIR__ . '/requested_filenames.log', "Brand products_branding setting: " . ($brand->products_branding ? '1' : '0') . " | price_override setting: " . ($brand->price_override ? '1' : '0') . "\n", FILE_APPEND);
         // Maintenance Mode handling
         if ($brand->maintenance_mode) {
@@ -662,7 +1259,9 @@ add_hook('ClientAreaPage', 1, function ($vars) {
         // }
         // print('<pre>');           
         // print_r($GLOBALS);die();
-        $overrides = [];
+        if (!isset($overrides)) {
+            $overrides = [];
+        }
 
         // Filter gateways brand-wise
         if (isset($vars['gateways']) && is_array($vars['gateways'])) {
@@ -672,7 +1271,14 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                     $allowedGateways = [];
                     foreach ($brandGateways as $gw) {
                         if (isset($gw['gateway']) && (!isset($gw['status']) || $gw['status'] == 1 || $gw['status'] === true)) {
-                            $allowedGateways[] = strtolower(trim($gw['gateway']));
+                            $val = strtolower(trim($gw['gateway']));
+                            $allowedGateways[] = $val;
+                            if ($val === 'paypalrest') {
+                                $allowedGateways[] = 'paypalcheckout';
+                                $allowedGateways[] = 'paypal_ppcpv';
+                                $allowedGateways[] = 'paypal_acdc';
+                                $allowedGateways[] = 'paypalbilling';
+                            }
                         }
                     }
                     if (!empty($allowedGateways)) {
@@ -794,7 +1400,7 @@ add_hook('ClientAreaPage', 1, function ($vars) {
         // --- Brand-wise Shopping Cart Catalog Filtering & Pricing Overrides ---
         $prodCount = isset($vars['products']) && is_array($vars['products']) ? count($vars['products']) : 'NOT ARRAY';
         $groupCount = isset($vars['productgroups']) && is_array($vars['productgroups']) ? count($vars['productgroups']) : 'NOT ARRAY';
-        // file_put_contents(__DIR__ . '/requested_filenames.log', "Cart override check: filename = $filename | products_branding = " . ($brand->products_branding ? '1' : '0') . " | products count: $prodCount | productgroups count: $groupCount\n", FILE_APPEND);
+        // file_put_contents(__DIR__ . '/requested_filenames.log', "Cart override check: filename = $filename | products_branding = " . ($brand->products_branding ? '1' : '0') | products count: $prodCount | productgroups count: $groupCount\n", FILE_APPEND);
         if ((in_array($filename, ['cart', 'index', 'cart_debug']) || isset($vars['productgroups']) || isset($vars['products']) || isset($vars['addons'])) && $brand->products_branding) {
             $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
             $brandProductIds = isset($pricingOverrides['products']) ? array_keys($pricingOverrides['products']) : [];
@@ -895,7 +1501,7 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                     
                     if ($bid > 0) {
                         // Filter bundle visibility
-                        if (!empty($brandBundleIds) && !in_array($bid, $brandBundleIds)) {
+                        if (!in_array($bid, $brandBundleIds)) {
                             continue;
                         }
                         
@@ -926,8 +1532,8 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                             $productId = isset($product->id) ? (int)$product->id : (isset($product->pid) ? (int)$product->pid : 0);
                         }
                         
-                        // Apply branding catalog visibility filter (if brand has attached products)
-                        if (!empty($brandProductIds) && !in_array($productId, $brandProductIds)) {
+                        // Apply branding catalog visibility filter
+                        if (!in_array($productId, $brandProductIds)) {
                             continue;
                         }
 
@@ -1073,7 +1679,7 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                                 $addonId = isset($pAddon->id) ? (int)$pAddon->id : (isset($pAddon->addonid) ? (int)$pAddon->addonid : 0);
                             }
                             if ($addonId > 0) {
-                                if (!empty($brandAddonIds) && !in_array($addonId, $brandAddonIds)) {
+                                if (!in_array($addonId, $brandAddonIds)) {
                                     continue;
                                 }
                                 
@@ -1126,7 +1732,7 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                     }
                     
                     if ($addonId > 0) {
-                        if (!empty($brandAddonIds) && !in_array($addonId, $brandAddonIds)) {
+                        if (!in_array($addonId, $brandAddonIds)) {
                             continue;
                         }
                         
@@ -1204,7 +1810,7 @@ add_hook('ClientAreaPage', 1, function ($vars) {
 
         // --- Brand-wise Client Area Data Filtering ---
         $clientId = (int)($_SESSION['uid'] ?? 0);
-        if ($clientId > 0) {
+        if ($clientId > 0 && (!$brand || $brand->is_default != 1)) {
             try {
                 // Fetch brand mappings lists
                 $brandServiceIds = Capsule::table('mod_multibrand_service_brands')
@@ -1229,11 +1835,26 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                     ->pluck('ticket_id')
                     ->toArray();
 
-                $brandDomainIds = Capsule::table('tbldomains')
-                    ->join('mod_multibrand_order_brands', 'tbldomains.orderid', '=', 'mod_multibrand_order_brands.order_id')
-                    ->where('mod_multibrand_order_brands.brand_id', $brand->id)
-                    ->pluck('tbldomains.id')
+                $brandDomainIds = Capsule::table('mod_multibrand_domain_brands')
+                    ->where('brand_id', $brand->id)
+                    ->pluck('domain_id')
                     ->toArray();
+
+                // Fetch addon IDs mapped explicitly to the brand
+                $explicitAddonIds = Capsule::table('mod_multibrand_addon_brands')
+                    ->where('brand_id', $brand->id)
+                    ->pluck('addon_id')
+                    ->toArray();
+
+                // Fetch addon IDs whose parent service is mapped to the brand
+                $serviceAddonIds = Capsule::table('tblhostingaddons')
+                    ->join('mod_multibrand_service_brands', 'tblhostingaddons.hostingid', '=', 'mod_multibrand_service_brands.service_id')
+                    ->where('mod_multibrand_service_brands.brand_id', $brand->id)
+                    ->pluck('tblhostingaddons.id')
+                    ->toArray();
+
+                // Merge and get unique IDs
+                $clientBrandAddonIds = array_unique(array_merge($explicitAddonIds, $serviceAddonIds));
 
                 // Helper to filter items in list (handles arrays and objects)
                 $filterEntityList = function ($list, $allowedIds) {
@@ -1255,11 +1876,96 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                     return $filtered;
                 };
 
-                // Filter services lists
+                // Filter services lists and merge product addon services
+                $clientAddonServices = [];
+                try {
+                    $statusFilter = $_GET['status'] ?? '';
+                    $query = Capsule::table('tblhostingaddons')
+                        ->leftJoin('tbladdons', 'tblhostingaddons.addonid', '=', 'tbladdons.id')
+                        ->leftJoin('tblhosting', 'tblhostingaddons.hostingid', '=', 'tblhosting.id')
+                        ->Join('mod_multibrand_addon_brands', 'tblhostingaddons.id', '=', 'mod_multibrand_addon_brands.addon_id')
+                        ->leftJoin('mod_multibrand_service_brands', 'tblhostingaddons.hostingid', '=', 'mod_multibrand_service_brands.service_id')
+                        ->where('tblhostingaddons.userid', $clientId)
+                        ->where(function($q) use ($brand) {
+                            $q->where('mod_multibrand_addon_brands.brand_id', $brand->id)
+                              ->orWhere('mod_multibrand_service_brands.brand_id', $brand->id);
+                        });
+
+                    if (!empty($statusFilter)) {
+                        $query->where('tblhostingaddons.status', $statusFilter);
+                    }
+
+                    $addonRecords = $query->select(
+                        'tblhostingaddons.id',
+                        'tblhostingaddons.name as custom_name',
+                        'tbladdons.name as addon_name',
+                        'tblhostingaddons.status',
+                        'tblhostingaddons.recurring',
+                        'tblhostingaddons.billingcycle',
+                        'tblhostingaddons.nextduedate',
+                        'tblhosting.domain as service_domain',
+                        'tblhostingaddons.hostingid'
+                    )->get();
+                    
+                    $currency = Capsule::table('tblclients')
+                        ->join('tblcurrencies', 'tblclients.currency', '=', 'tblcurrencies.id')
+                        ->where('tblclients.id', $clientId)
+                        ->select('tblcurrencies.prefix', 'tblcurrencies.suffix', 'tblcurrencies.code')
+                        ->first();
+                    if (!$currency) {
+                        $currency = Capsule::table('tblcurrencies')->where('default', 1)->first();
+                    }
+                    
+                    $formatPrice = function($amount) use ($currency) {
+                        $prefix = $currency ? $currency->prefix : '$';
+                        $suffix = $currency ? $currency->suffix : ' USD';
+                        return $prefix . number_format($amount, 2) . $suffix;
+                    };
+
+                    foreach ($addonRecords as $addon) {
+                        $name = $addon->custom_name ?: ($addon->addon_name ?: 'Addon');
+                        
+                        $formattedAddon = [
+                            'id' => 'a' . $addon->id,
+                            'isAddon' => true,
+                            'product' => $name,
+                            'domain' => $addon->service_domain ?: '',
+                            'amount' => $formatPrice($addon->recurring),
+                            'amountnum' => (float)$addon->recurring,
+                            'billingcycle' => $addon->billingcycle,
+                            'nextduedate' => $addon->nextduedate ? fromMySQLDate($addon->nextduedate) : '-',
+                            'normalisedNextDueDate' => $addon->nextduedate ?: '0000-00-00',
+                            'status' => $addon->status,
+                            'statustext' => $addon->status,
+                            'isActive' => ($addon->status == 'Active'),
+                            'sslStatus' => null,
+                            'hostingid' => $addon->hostingid,
+                        ];
+
+                        $clientAddonServices[] = new MultibrandClientAreaAddonWrapper($formattedAddon);
+                    }
+                   
+                } catch (\Exception $e) {}
+//  print_r($addonRecords);die();
                 $serviceKeys = ['services', 'activeServices', 'activeservices', 'activeproducts', 'activeProducts'];
                 foreach ($serviceKeys as $key) {
                     if (isset($vars[$key]) && is_array($vars[$key])) {
-                        $overrides[$key] = $filterEntityList($vars[$key], $brandServiceIds);
+                        $filtered = $filterEntityList($vars[$key], $brandServiceIds);
+                        if ($filename == 'clientarea' || $filename == 'index') {
+                            $overrides[$key] = array_merge($filtered, $clientAddonServices);
+                        } else {
+                            $overrides[$key] = $filtered;
+                        }
+                    }
+                }
+
+                // Filter addons lists
+                $addonKeys = ['addons', 'activeAddons', 'activeaddons'];
+                foreach ($addonKeys as $key) {
+                    if (isset($vars[$key]) && is_array($vars[$key])) {
+                        if ($filename !== 'cart' && $filename !== 'index') {
+                            $overrides[$key] = $filterEntityList($vars[$key], $clientBrandAddonIds);
+                        }
                     }
                 }
 
@@ -1339,7 +2045,9 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                 $domainKeys = ['domains', 'activeDomains', 'activedomains'];
                 foreach ($domainKeys as $key) {
                     if (isset($vars[$key]) && is_array($vars[$key])) {
-                        $overrides[$key] = $filterEntityList($vars[$key], $brandDomainIds);
+                        if ($filename !== 'cart' && $filename !== 'index') {
+                            $overrides[$key] = $filterEntityList($vars[$key], $brandDomainIds);
+                        }
                     }
                 }
 
@@ -1412,7 +2120,7 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                     $overrides['totalresults'] = $stats['total_tickets'];
                     $overrides['numtickets'] = $stats['total_tickets'];
                 }
-
+                    
                 // Filter Related Services in Submit Ticket page brand-wise
                 if ($filename == 'submitticket' && isset($vars['relatedservices']) && is_array($vars['relatedservices'])) {
                     $filteredRelatedServices = [];
@@ -1445,7 +2153,9 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                 }
 
                 // Filter Client Alerts brand-wise
-                if (isset($vars['clientAlerts']) && $vars['clientAlerts'] instanceof \Illuminate\Support\Collection) {
+                if (isset($vars['clientAlerts']) && (is_array($vars['clientAlerts']) || $vars['clientAlerts'] instanceof \Illuminate\Support\Collection)) {
+                    global $_LANG;
+
                     $brandUnpaidCount = (int)Capsule::table('tblinvoices')
                         ->join('mod_multibrand_invoice_brands', 'tblinvoices.id', '=', 'mod_multibrand_invoice_brands.invoice_id')
                         ->where('tblinvoices.userid', $clientId)
@@ -1469,57 +2179,158 @@ add_hook('ClientAreaPage', 1, function ($vars) {
                         $brandOverdueBalance += (float)$inv->total - (float)($inv->credit ?? 0.00);
                     }
 
+                    $client = Capsule::table('tblclients')->where('id', $clientId)->first();
+                    $currencyId = $client ? (int)$client->currency : 1;
+                    if (function_exists('formatCurrency')) {
+                        $brandOverdueBalanceFormatted = formatCurrency($brandOverdueBalance, $currencyId);
+                    } else {
+                        $currObj = Capsule::table('tblcurrencies')->where('id', $currencyId)->first();
+                        $prefix = $currObj ? $currObj->prefix : '$';
+                        $suffix = $currObj ? $currObj->suffix : ' USD';
+                        $brandOverdueBalanceFormatted = $prefix . number_format($brandOverdueBalance, 2) . $suffix;
+                    }
+
+                    $unpaidLang = $_LANG['clientAlerts']['invoicesUnpaid'] ?? ($vars['_LANG']['clientAlerts']['invoicesUnpaid'] ?? 'You have :numberOfInvoices unpaid invoice(s). Pay them early for peace of mind.');
+                    $overdueLang = $_LANG['clientAlerts']['invoicesOverdue'] ?? ($vars['_LANG']['clientAlerts']['invoicesOverdue'] ?? 'You have :numberOfInvoices overdue invoice(s) with a total balance due of :balanceDue. Pay them now to avoid any interruptions in service.');
+                    $domainLang = $_LANG['clientAlerts']['domainsExpiringSoon'] ?? ($vars['_LANG']['clientAlerts']['domainsExpiringSoon'] ?? 'You have :numberOfDomains domain(s) expiring within the next :days days.');
+
+                    // Determine the threshold for expiring domains alert
+                    $days = 7;
+                    $hasGlobalExpiringAlert = false;
+                    foreach ($vars['clientAlerts'] as $alert) {
+                        if (is_object($alert)) {
+                            $originalMsg = $alert->getMessage();
+                            $link = $alert->getLink();
+                            
+                            $isDomain = false;
+                            if ($domainLang !== '') {
+                                $pattern = '/^' . str_replace([':numberOfDomains', ':days'], ['.+', '.+'], preg_quote($domainLang, '/')) . '$/i';
+                                if (preg_match($pattern, $originalMsg)) {
+                                    $isDomain = true;
+                                }
+                            }
+                            if (!$isDomain && (stripos($originalMsg, 'domain') !== false || stripos($link, 'domain') !== false || stripos($link, 'renew') !== false)) {
+                                $isDomain = true;
+                            }
+                            
+                            if ($isDomain) {
+                                $hasGlobalExpiringAlert = true;
+                                if (preg_match('/within the next (\d+) days/i', $originalMsg, $dayMatches)) {
+                                    $days = (int)$dayMatches[1];
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    $brandExpiringCount = 0;
+                    if ($hasGlobalExpiringAlert) {
+                        $brandExpiringCount = Capsule::table('tbldomains')
+                            ->join('mod_multibrand_domain_brands', 'tbldomains.id', '=', 'mod_multibrand_domain_brands.domain_id')
+                            ->where('tbldomains.userid', $clientId)
+                            ->where('mod_multibrand_domain_brands.brand_id', $brand->id)
+                            ->where('tbldomains.status', 'Active')
+                            ->where('tbldomains.expirydate', '>', $today)
+                            ->where('tbldomains.expirydate', '<=', date('Y-m-d', strtotime('+' . $days . ' days')))
+                            ->count();
+                    }
+
+                    // Filter out existing alerts
                     $filteredAlerts = [];
                     foreach ($vars['clientAlerts'] as $alert) {
-                        if ($alert instanceof \WHMCS\User\Alert) {
+                        if (is_object($alert)) {
+                            $originalMsg = $alert->getMessage();
                             $link = $alert->getLink();
-                            if (strpos($link, 'action=masspay') !== false) {
+                            
+                            $isOverdue = false;
+                            if ($overdueLang !== '') {
+                                $pattern = '/^' . str_replace([':numberOfInvoices', ':balanceDue'], ['.+', '.+'], preg_quote($overdueLang, '/')) . '$/i';
+                                if (preg_match($pattern, $originalMsg)) {
+                                    $isOverdue = true;
+                                }
+                            }
+                            if (!$isOverdue && stripos($originalMsg, 'overdue') !== false) {
+                                $isOverdue = true;
+                            }
+
+                            $isUnpaid = false;
+                            if ($unpaidLang !== '') {
+                                $pattern = '/^' . str_replace(':numberOfInvoices', '.+', preg_quote($unpaidLang, '/')) . '$/i';
+                                if (preg_match($pattern, $originalMsg)) {
+                                    $isUnpaid = true;
+                                }
+                            }
+                            if (!$isUnpaid && (stripos($originalMsg, 'unpaid') !== false || strpos($link, 'action=masspay') !== false)) {
+                                $isUnpaid = true;
+                            }
+
+                            $isDomain = false;
+                            if ($domainLang !== '') {
+                                $pattern = '/^' . str_replace([':numberOfDomains', ':days'], ['.+', '.+'], preg_quote($domainLang, '/')) . '$/i';
+                                if (preg_match($pattern, $originalMsg)) {
+                                    $isDomain = true;
+                                }
+                            }
+                            if (!$isDomain && (stripos($originalMsg, 'domain') !== false || stripos($link, 'domain') !== false || stripos($link, 'renew') !== false)) {
+                                $isDomain = true;
+                            }
+
+                            if ($isOverdue || $isUnpaid || $isDomain) {
                                 continue;
                             }
                         }
                         $filteredAlerts[] = $alert;
                     }
 
+                    $payNowText = $_LANG['paynow'] ?? ($vars['LANG']['paynow'] ?? 'Pay Now');
+                    $renewNowText = $_LANG['renewnow'] ?? ($vars['LANG']['renewnow'] ?? 'Renew Now');
+
+                    // Append brand-specific unpaid invoice alert
                     if ($brandUnpaidCount > 0) {
-                        $unpaidMsg = $vars['LANG']['unpaidinvoicesalert'] ?? 'You have :numUnpaid unpaid invoice(s). Pay them early for peace of mind.';
-                        $unpaidMsg = str_replace(':numUnpaid', $brandUnpaidCount, $unpaidMsg);
+                        $unpaidMsg = str_replace(':numberOfInvoices', $brandUnpaidCount, $unpaidLang);
                         $filteredAlerts[] = new \WHMCS\User\Alert(
                             $unpaidMsg,
                             'info',
                             'clientarea.php?action=masspay&all=true',
-                            $vars['LANG']['paynow'] ?? 'Pay Now'
+                            $payNowText
                         );
                     }
 
+                    // Append brand-specific overdue invoice alert
                     if ($brandOverdueCount > 0) {
-                        $overdueMsg = $vars['LANG']['overdueinvoicesalert'] ?? 'You have :numOverdue overdue invoice(s) with a total balance due of :balance. Pay them now to avoid any interruptions in service.';
-                        
-                        $client = Capsule::table('tblclients')->where('id', $clientId)->first();
-                        $currencyId = $client ? (int)$client->currency : 1;
-                        if (function_exists('formatCurrency')) {
-                            $brandOverdueBalanceFormatted = formatCurrency($brandOverdueBalance, $currencyId);
-                        } else {
-                            $currObj = Capsule::table('tblcurrencies')->where('id', $currencyId)->first();
-                            $prefix = $currObj ? $currObj->prefix : '$';
-                            $suffix = $currObj ? $currObj->suffix : ' USD';
-                            $brandOverdueBalanceFormatted = $prefix . number_format($brandOverdueBalance, 2) . $suffix;
-                        }
-
                         $overdueMsg = str_replace(
-                            [':numOverdue', ':balance'],
+                            [':numberOfInvoices', ':balanceDue'],
                             [$brandOverdueCount, $brandOverdueBalanceFormatted],
-                            $overdueMsg
+                            $overdueLang
                         );
-
                         $filteredAlerts[] = new \WHMCS\User\Alert(
                             $overdueMsg,
                             'warning',
                             'clientarea.php?action=masspay&all=true',
-                            $vars['LANG']['paynow'] ?? 'Pay Now'
+                            $payNowText
                         );
                     }
 
-                    $overrides['clientAlerts'] = new \Illuminate\Support\Collection($filteredAlerts);
+                    // Append brand-specific expiring domain alert
+                    if ($brandExpiringCount > 0) {
+                        $domainMsg = str_replace(
+                            [':numberOfDomains', ':days'],
+                            [$brandExpiringCount, $days],
+                            $domainLang
+                        );
+                        $filteredAlerts[] = new \WHMCS\User\Alert(
+                            $domainMsg,
+                            'danger',
+                            'index.php?rp=/cart/domain/renew',
+                            $renewNowText
+                        );
+                    }
+
+                    if ($vars['clientAlerts'] instanceof \Illuminate\Support\Collection) {
+                        $overrides['clientAlerts'] = new \Illuminate\Support\Collection($filteredAlerts);
+                    } else {
+                        $overrides['clientAlerts'] = $filteredAlerts;
+                    }
                 }
             } catch (\Exception $e) {}
         }
@@ -1711,6 +2522,129 @@ add_hook('ClientAreaPage', 1, function ($vars) {
             } catch (\Exception $e) {}
         }
 
+        // Brand TLD pricing overrides
+        if (isset($vars['pricing']) && is_array($vars['pricing']) && isset($vars['pricing']['pricing']) && is_array($vars['pricing']['pricing'])) {
+            $pricingVar = $vars['pricing'];
+            $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+            if ($brand->price_override && isset($pricingOverrides['domains']) && !empty($pricingOverrides['domains'])) {
+                $currencyId = (int)($pricingVar['currency']['id'] ?? $_SESSION['currency'] ?? 1);
+                $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+                if ($currencyObj) {
+                    foreach ($pricingVar['pricing'] as $tld => $tldData) {
+                        $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', '.' . $tld)->first();
+                        if ($domainTemplate) {
+                            $domainId = $domainTemplate->id;
+                            $domainOverrides = $pricingOverrides['domains'][$domainId]['pricing'] ?? [];
+                            if (!empty($domainOverrides)) {
+                                $rates = $domainOverrides[$currencyId] ?? [];
+                                if (!empty($rates)) {
+                                    foreach (['register', 'transfer', 'renew'] as $type) {
+                                        if (isset($tldData[$type]) && is_array($tldData[$type])) {
+                                            foreach ($tldData[$type] as $year => $priceObj) {
+                                                $key = $type . $year;
+                                                if (isset($rates[$key]) && $rates[$key] !== '' && $rates[$key] >= 0) {
+                                                    $newPrice = (float)$rates[$key];
+                                                    $pricingVar['pricing'][$tld][$type][$year] = new \WHMCS\View\Formatter\Price($newPrice, $currencyObj);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    $overrides['pricing'] = $pricingVar;
+                }
+            }
+        }
+
+        if (isset($vars['featuredTlds']) && is_array($vars['featuredTlds'])) {
+            $featuredTldsVar = $vars['featuredTlds'];
+            $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+            if ($brand->price_override && isset($pricingOverrides['domains']) && !empty($pricingOverrides['domains'])) {
+                $currencyId = (int)($_SESSION['currency'] ?? 1);
+                $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+                if ($currencyObj) {
+                    foreach ($featuredTldsVar as $num => $tldinfo) {
+                        $tld = is_array($tldinfo) ? ($tldinfo['tld'] ?? '') : ($tldinfo->tld ?? '');
+                        $cleanTld = '.' . ltrim($tld, '.');
+                        $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $cleanTld)->first();
+                        if ($domainTemplate) {
+                            $domainId = $domainTemplate->id;
+                            $domainOverrides = $pricingOverrides['domains'][$domainId]['pricing'] ?? [];
+                            if (!empty($domainOverrides)) {
+                                $rates = $domainOverrides[$currencyId] ?? [];
+                                if (!empty($rates)) {
+                                    if (is_array($tldinfo)) {
+                                        if (isset($tldinfo['register']) && is_object($tldinfo['register'])) {
+                                            $regperiod = $tldinfo['period'] ?? 1;
+                                            $key = 'register' . $regperiod;
+                                            if (isset($rates[$key]) && $rates[$key] !== '' && $rates[$key] >= 0) {
+                                                $featuredTldsVar[$num]['register'] = new \WHMCS\View\Formatter\Price((float)$rates[$key], $currencyObj);
+                                            }
+                                        }
+                                    } else if (is_object($tldinfo)) {
+                                        if (isset($tldinfo->register) && is_object($tldinfo->register)) {
+                                            $regperiod = $tldinfo->period ?? 1;
+                                            $key = 'register' . $regperiod;
+                                            if (isset($rates[$key]) && $rates[$key] !== '' && $rates[$key] >= 0) {
+                                                $tldinfo->register = new \WHMCS\View\Formatter\Price((float)$rates[$key], $currencyObj);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    $overrides['featuredTlds'] = $featuredTldsVar;
+                }
+            }
+        }
+
+        if (isset($vars['spotlightTlds']) && is_array($vars['spotlightTlds'])) {
+            $spotlightTldsVar = $vars['spotlightTlds'];
+            $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+            if ($brand->price_override && isset($pricingOverrides['domains']) && !empty($pricingOverrides['domains'])) {
+                $currencyId = (int)($_SESSION['currency'] ?? 1);
+                $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+                if ($currencyObj) {
+                    foreach ($spotlightTldsVar as $tld => $data) {
+                        $cleanTld = '.' . ltrim($tld, '.');
+                        $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $cleanTld)->first();
+                        if ($domainTemplate) {
+                            $domainId = $domainTemplate->id;
+                            $domainOverrides = $pricingOverrides['domains'][$domainId]['pricing'] ?? [];
+                            if (!empty($domainOverrides)) {
+                                $rates = $domainOverrides[$currencyId] ?? [];
+                                if (!empty($rates)) {
+                                    foreach (['register', 'transfer', 'renew'] as $type) {
+                                        $key = $type . '1';
+                                        if (isset($rates[$key]) && $rates[$key] !== '' && $rates[$key] >= 0) {
+                                            $newPrice = (float)$rates[$key];
+                                            if (is_array($data)) {
+                                                if (is_object($data[$type])) {
+                                                    $spotlightTldsVar[$tld][$type] = new \WHMCS\View\Formatter\Price($newPrice, $currencyObj);
+                                                } else {
+                                                    $spotlightTldsVar[$tld][$type] = formatCurrency($newPrice, $currencyId);
+                                                }
+                                            } else if (is_object($data)) {
+                                                if (is_object($data->$type)) {
+                                                    $data->$type = new \WHMCS\View\Formatter\Price($newPrice, $currencyObj);
+                                                } else {
+                                                    $data->$type = formatCurrency($newPrice, $currencyId);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    $overrides['spotlightTlds'] = $spotlightTldsVar;
+                }
+            }
+        }
+
         if (isset($GLOBALS['smarty']) && is_object($GLOBALS['smarty']) && method_exists($GLOBALS['smarty'], 'assign')) {
             foreach ($overrides as $key => $value) {
                 $GLOBALS['smarty']->assign($key, $value);
@@ -1900,7 +2834,7 @@ if (!function_exists('multibrand_filter_sidebar_popular_downloads')) {
  */
 add_hook('ClientAreaPrimarySidebar', 1, function ($primarySidebar) {
     $brand = get_multibrand_active_brand();
-    if ($brand) {
+    if ($brand && $brand->is_default != 1) {
         multibrand_filter_sidebar_kb_categories($primarySidebar, $brand->id);
         multibrand_filter_sidebar_popular_downloads($primarySidebar, $brand->id);
 
@@ -2056,6 +2990,23 @@ add_hook('ClientAreaPrimarySidebar', 1, function ($primarySidebar) {
                     ->groupBy('tblhosting.domainstatus')
                     ->pluck('count', 'domainstatus')
                     ->toArray();
+                   
+                $addonStatusCounts = Capsule::table('tblhostingaddons')
+                    ->Join('mod_multibrand_addon_brands', 'tblhostingaddons.id', '=', 'mod_multibrand_addon_brands.addon_id')
+                    ->leftJoin('mod_multibrand_service_brands', 'tblhostingaddons.hostingid', '=', 'mod_multibrand_service_brands.service_id')
+                    ->where('tblhostingaddons.userid', $clientId)
+                    ->where(function($q) use ($brand) {
+                        $q->where('mod_multibrand_addon_brands.brand_id', $brand->id)
+                          ->orWhere('mod_multibrand_service_brands.brand_id', $brand->id);
+                    })
+                    ->select('tblhostingaddons.status', Capsule::raw('count(*) as count'))
+                    ->groupBy('tblhostingaddons.status')
+                    ->pluck('count', 'status')
+                    ->toArray();
+                     
+                foreach ($addonStatusCounts as $status => $count) {
+                    $statusCounts[$status] = ($statusCounts[$status] ?? 0) + $count;
+                }
 
                 foreach (['Active', 'Pending', 'Suspended', 'Terminated', 'Cancelled'] as $status) {
                     $child = $servicesStatusFilter->getChild($status);
@@ -2090,6 +3041,41 @@ add_hook('ClientAreaPrimarySidebar', 1, function ($primarySidebar) {
             } catch (\Exception $e) {}
         }
 
+        // 8. Domain Status Filter
+        $domainsStatusFilter = $primarySidebar->getChild('Domain Status Filter');
+        if (!$domainsStatusFilter) {
+            $domainsStatusFilter = $primarySidebar->getChild('My Domains Status Filter');
+        }
+        if ($domainsStatusFilter) {
+            try {
+                $statusCounts = Capsule::table('tbldomains')
+                    ->join('mod_multibrand_domain_brands', 'tbldomains.id', '=', 'mod_multibrand_domain_brands.domain_id')
+                    ->where('tbldomains.userid', $clientId)
+                    ->where('mod_multibrand_domain_brands.brand_id', $brand->id)
+                    ->select('tbldomains.status', Capsule::raw('count(*) as count'))
+                    ->groupBy('tbldomains.status')
+                    ->pluck('count', 'status')
+                    ->toArray();
+
+                $statusMap = [
+                    'Active' => 'clientareaactive',
+                    'Pending' => 'clientareapending',
+                    'Expired' => 'clientareaexpired',
+                    'Grace' => 'clientareagrace'
+                ];
+
+                foreach ($statusMap as $status => $childName) {
+                    $child = $domainsStatusFilter->getChild($childName);
+                    if ($child) {
+                        $count = isset($statusCounts[$status]) ? (int)$statusCounts[$status] : 0;
+                        $child->setBadge($count);
+                    }
+                }
+            } catch (\Exception $e) {
+                // Ignore gracefully
+            }
+        }
+
         multibrand_filter_sidebar_tickets($primarySidebar, $brand->id);
         }
     }
@@ -2101,7 +3087,7 @@ add_hook('ClientAreaPrimarySidebar', 1, function ($primarySidebar) {
  */
 add_hook('ClientAreaSecondarySidebar', 1, function ($secondarySidebar) {
     $brand = get_multibrand_active_brand();
-    if ($brand) {
+    if ($brand && $brand->is_default != 1) {
         multibrand_filter_sidebar_kb_categories($secondarySidebar, $brand->id);
         multibrand_filter_sidebar_popular_downloads($secondarySidebar, $brand->id);
 
@@ -2156,7 +3142,7 @@ add_hook('ClientAreaHomepagePanels', 1, function ($homePagePanels) {
     $brand = get_multibrand_active_brand();
     $clientId = (int)($_SESSION['uid'] ?? 0);
 
-    if ($brand && $clientId > 0) {
+    if ($brand && $brand->is_default != 1 && $clientId > 0) {
         $stats = get_multibrand_client_stats($clientId, $brand->id);
 
         // 1. Filter "Active Products/Services" panel
@@ -2323,6 +3309,64 @@ add_hook('ClientAreaHomepagePanels', 1, function ($homePagePanels) {
                     if ($annId > 0 && !in_array($annId, $brandAnnIds)) {
                         $recentNewsPanel->removeChild($child->getName());
                     }
+                }
+            }
+        }
+
+        // 5. Filter "Domains Expiring Soon" panel
+        $expiringDomainsPanel = $homePagePanels->getChild('Domains Expiring Soon');
+        if ($expiringDomainsPanel) {
+            $brandDomainIds = Capsule::table('mod_multibrand_domain_brands')
+                ->where('brand_id', $brand->id)
+                ->pluck('domain_id')
+                ->toArray();
+
+            // Recalculate brand's expiring domains count
+            $bodyHtml = $expiringDomainsPanel->getBodyHtml();
+            $days = 45; // default fallback
+            if ($bodyHtml && preg_match('/within the next (\d+) days/i', $bodyHtml, $dayMatches)) {
+                $days = (int)$dayMatches[1];
+            }
+
+            $brandExpiringCount = Capsule::table('tbldomains')
+                ->join('mod_multibrand_domain_brands', 'tbldomains.id', '=', 'mod_multibrand_domain_brands.domain_id')
+                ->where('tbldomains.userid', $clientId)
+                ->where('mod_multibrand_domain_brands.brand_id', $brand->id)
+                ->where('tbldomains.status', 'Active')
+                ->where('tbldomains.expirydate', '>', date('Y-m-d'))
+                ->where('tbldomains.expirydate', '<=', date('Y-m-d', strtotime('+' . $days . ' days')))
+                ->count();
+
+            if ($brandExpiringCount === 0) {
+                $homePagePanels->removeChild('Domains Expiring Soon');
+            } else {
+                foreach ($expiringDomainsPanel->getChildren() as $child) {
+                    $uri = $child->getUri();
+                    $label = $child->getLabel();
+                    $domainId = 0;
+                    if (preg_match('/id=(\d+)/', $uri, $matches)) {
+                        $domainId = (int)$matches[1];
+                    }
+                    if ($domainId === 0 && preg_match('/id=(\d+)/', $label, $matches)) {
+                        $domainId = (int)$matches[1];
+                    }
+                    if ($domainId > 0 && !in_array($domainId, $brandDomainIds)) {
+                        $expiringDomainsPanel->removeChild($child->getName());
+                    }
+                }
+
+                if ($bodyHtml) {
+                    // Query client's total expiring domains
+                    $clientTotalExpiringCount = Capsule::table('tbldomains')
+                        ->where('userid', $clientId)
+                        ->where('status', 'Active')
+                        ->where('expirydate', '>', date('Y-m-d'))
+                        ->where('expirydate', '<=', date('Y-m-d', strtotime('+' . $days . ' days')))
+                        ->count();
+
+                    // Replace the first occurrence of the count with the brand count
+                    $bodyHtml = preg_replace('/(?<!\d)' . $clientTotalExpiringCount . '(?!\d)/', $brandExpiringCount, $bodyHtml, 1);
+                    $expiringDomainsPanel->setBodyHtml($bodyHtml);
                 }
             }
         }
@@ -2614,7 +3658,6 @@ add_hook('ClientAreaPageViewInvoice', 1, function ($vars) {
                             $val = strtolower($gw['gateway']);
                             $allowedGateways[] = $val;
                             if ($val === 'paypalrest') {
-                                $allowedGateways[] = 'paypal';
                                 $allowedGateways[] = 'paypalcheckout';
                                 $allowedGateways[] = 'paypal_ppcpv';
                                 $allowedGateways[] = 'paypal_acdc';
@@ -2683,6 +3726,35 @@ add_hook('ClientAreaPageViewInvoice', 1, function ($vars) {
 });
 
 /**
+ * Pre-Calculate Cart Totals Hook
+ * Validates the applied promotion code brand-wise and clears it if unauthorized
+ */
+add_hook('PreCalculateCartTotals', 1, function ($vars) {
+    if (!empty($_SESSION['cart']['promo'])) {
+        $promoCode = $_SESSION['cart']['promo'];
+        $brand = get_multibrand_active_brand();
+        if ($brand) {
+            $promo = Capsule::table('tblpromotions')->where('code', $promoCode)->first();
+            if (!$promo) {
+                $promo = Capsule::table('tblpromotions')
+                    ->whereRaw('LOWER(code) = ?', [strtolower($promoCode)])
+                    ->first();
+            }
+            if ($promo) {
+                $isMapped = Capsule::table('mod_multibrand_promotion_brands')
+                    ->where('promotion_id', $promo->id)
+                    ->where('brand_id', $brand->id)
+                    ->exists();
+                if (!$isMapped) {
+                    unset($_SESSION['cart']['promo']);
+                    $_SESSION['multibrand_promo_error'] = true;
+                }
+            }
+        }
+    }
+});
+
+/**
  * Cart Page Hook
  * Filters the available payment methods on the checkout page based on the active brand
  */
@@ -2698,7 +3770,6 @@ add_hook('ClientAreaPageCart', 1, function ($vars) {
                         $val = strtolower($gw['gateway']);
                         $allowedGateways[] = $val;
                         if ($val === 'paypalrest') {
-                            $allowedGateways[] = 'paypal';
                             $allowedGateways[] = 'paypalcheckout';
                             $allowedGateways[] = 'paypal_ppcpv';
                             $allowedGateways[] = 'paypal_acdc';
@@ -2723,6 +3794,733 @@ add_hook('ClientAreaPageCart', 1, function ($vars) {
         }
     } catch (\Exception $e) {}
 });
+
+/**
+ * Cart Page Domain Pricing Override Hook
+ * Applies brand-wise TLD pricing overrides on the domain registration search results page
+ */
+add_hook('ClientAreaPageCart', 5, function ($vars) {
+    try {
+        $overrides = [];
+
+        // Handle promo code brand restriction error display
+        if (isset($_SESSION['multibrand_promo_error'])) {
+            unset($_SESSION['multibrand_promo_error']);
+            
+            $promoErr = 'The promotion code you entered is not valid for this brand.';
+            if (isset($vars['language'])) {
+                $lang = strtolower($vars['language']);
+                if ($lang == 'spanish') {
+                    $promoErr = 'El código de promoción ingresado no es válido para esta marca.';
+                } elseif ($lang == 'french') {
+                    $promoErr = 'Le code promotionnel saisi n\'est pas valide pour cette marque.';
+                } elseif ($lang == 'german') {
+                    $promoErr = 'Der eingegebene Gutscheincode ist für diese Marke nicht gültig.';
+                }
+            }
+            $overrides['promoerrormessage'] = $promoErr;
+        }
+
+        override_renewal_prices_in_cart($vars);
+        if (isset($vars['templatefile']) && $vars['templatefile'] === 'viewcart') {
+            $varsSummary = [];
+            foreach ($vars as $key => $val) {
+                if (is_object($val)) {
+                    $varsSummary[$key] = 'Object: ' . get_class($val) . ' | Value: ' . (method_exists($val, 'toNumeric') ? $val->toNumeric() : 'Object');
+                } elseif (is_array($val)) {
+                    $varsSummary[$key] = 'Array of size ' . count($val);
+                } else {
+                    $varsSummary[$key] = $val;
+                }
+            }
+            file_put_contents(__DIR__ . '/cart_vars_summary.json', json_encode($varsSummary, JSON_PRETTY_PRINT));
+        }
+
+        $brand = get_multibrand_active_brand();
+        if (!$brand || (!$brand->price_override && !$brand->products_branding)) {
+            if (!empty($overrides)) {
+                if (isset($GLOBALS['smarty']) && is_object($GLOBALS['smarty']) && method_exists($GLOBALS['smarty'], 'assign')) {
+                    foreach ($overrides as $key => $value) {
+                        $GLOBALS['smarty']->assign($key, $value);
+                    }
+                }
+                return $overrides;
+            }
+            return;
+        }
+
+        $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+
+        // 1. Override the main pricing array (TLD search results pricing table)
+        if (isset($vars['pricing']) && is_array($vars['pricing'])) {
+            $pricingVar = $vars['pricing'];
+            $currencyId = (int)($pricingVar['currency']['id'] ?? $_SESSION['currency'] ?? 1);
+            $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+
+            if ($currencyObj && isset($pricingVar['pricing']) && is_array($pricingVar['pricing'])) {
+                foreach ($pricingVar['pricing'] as $tld => $tldData) {
+                    $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', '.' . ltrim($tld, '.'))->first();
+                    if (!$domainTemplate) {
+                        unset($pricingVar['pricing'][$tld]);
+                        continue;
+                    }
+
+                    $domainId = $domainTemplate->id;
+                    if (!isset($pricingOverrides['domains'][$domainId])) {
+                        unset($pricingVar['pricing'][$tld]);
+                        continue;
+                    }
+
+                    // Apply price overrides only if price_override is enabled
+                    if ($brand->price_override) {
+                        $domainOverrides = $pricingOverrides['domains'][$domainId]['pricing'] ?? [];
+                        $rates = $domainOverrides[$currencyId] ?? [];
+                        if (!empty($rates)) {
+                            foreach (['register', 'transfer', 'renew'] as $type) {
+                                if (isset($tldData[$type]) && is_array($tldData[$type])) {
+                                    foreach ($tldData[$type] as $year => $priceObj) {
+                                        $key = $type . $year;
+                                        if (isset($rates[$key]) && $rates[$key] !== '' && $rates[$key] >= 0) {
+                                            $pricingVar['pricing'][$tld][$type][$year] = new \WHMCS\View\Formatter\Price((float)$rates[$key], $currencyObj);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Recalculate categoriesWithCounts based on remaining TLDs
+                $newCategoriesWithCounts = [];
+                foreach ($pricingVar['pricing'] as $tld => $tldData) {
+                    if (isset($tldData['categories']) && is_array($tldData['categories'])) {
+                        foreach ($tldData['categories'] as $cat) {
+                            $newCategoriesWithCounts[$cat] = ($newCategoriesWithCounts[$cat] ?? 0) + 1;
+                        }
+                    }
+                }
+                $overrides['categoriesWithCounts'] = $newCategoriesWithCounts;
+                $overrides['pricing'] = $pricingVar;
+            }
+        }
+
+        // 2. Override the direct domain search result: $vars['results'] array
+        // When user searches for a specific domain, WHMCS returns results with price
+        if (isset($vars['results']) && is_array($vars['results'])) {
+            $currencyId = (int)($_SESSION['currency'] ?? 1);
+            $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+
+            if ($currencyObj) {
+                $results = $vars['results'];
+                foreach ($results as $i => $result) {
+                    $tld = '';
+                    if (is_array($result)) {
+                        $tld = $result['tld'] ?? $result['extension'] ?? '';
+                    } elseif (is_object($result)) {
+                        $tld = $result->tld ?? $result->extension ?? '';
+                    }
+                    if (!$tld) {
+                        // Try to parse from domain name
+                        $domainName = is_array($result) ? ($result['domain'] ?? '') : ($result->domain ?? '');
+                        if ($domainName && strpos($domainName, '.') !== false) {
+                            $tld = substr($domainName, strpos($domainName, '.'));
+                        }
+                    }
+                    if (!$tld) continue;
+
+                    $cleanTld = '.' . ltrim($tld, '.');
+                    $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $cleanTld)->first();
+                    if (!$domainTemplate) {
+                        if (is_array($result)) {
+                            $results[$i]['status'] = 'unavailable';
+                        } else if (is_object($result)) {
+                            $result->status = 'unavailable';
+                            $results[$i] = $result;
+                        }
+                        continue;
+                    }
+
+                    $domainId = $domainTemplate->id;
+                    if (!isset($pricingOverrides['domains'][$domainId])) {
+                        if (is_array($result)) {
+                            $results[$i]['status'] = 'unavailable';
+                            if (isset($results[$i]['isAvailable'])) {
+                                $results[$i]['isAvailable'] = false;
+                            }
+                        } else if (is_object($result)) {
+                            $result->status = 'unavailable';
+                            if (property_exists($result, 'isAvailable')) {
+                                $result->isAvailable = false;
+                            }
+                            if (method_exists($result, 'setStatus')) {
+                                try {
+                                    $result->setStatus(\WHMCS\Domains\DomainLookup\SearchResult::STATUS_NOT_REGISTERED);
+                                } catch (\Exception $e) {}
+                            }
+                            $results[$i] = $result;
+                        }
+                        continue;
+                    }
+
+                    // Apply price overrides only if price_override is enabled
+                    if ($brand->price_override) {
+                        $domainOverrides = $pricingOverrides['domains'][$domainId]['pricing'] ?? [];
+                        $rates = $domainOverrides[$currencyId] ?? [];
+                        if (empty($rates)) continue;
+
+                        $regperiod = is_array($result) ? (int)($result['regperiod'] ?? 1) : (int)($result->regperiod ?? 1);
+                        $regKey = 'register' . $regperiod;
+
+                        if (isset($rates[$regKey]) && $rates[$regKey] !== '' && $rates[$regKey] >= 0) {
+                            $newPrice = (float)$rates[$regKey];
+                            $priceObj = new \WHMCS\View\Formatter\Price($newPrice, $currencyObj);
+                            if (is_array($result)) {
+                                $results[$i]['price'] = $priceObj;
+                                $results[$i]['register'] = $priceObj;
+                                if (isset($results[$i]['pricetext'])) {
+                                    $results[$i]['pricetext'] = formatCurrency($newPrice, $currencyId);
+                                }
+                            } elseif (is_object($result)) {
+                                $result->price = $priceObj;
+                                $result->register = $priceObj;
+                                if (isset($result->pricetext)) {
+                                    $result->pricetext = formatCurrency($newPrice, $currencyId);
+                                }
+                                $results[$i] = $result;
+                            }
+                        }
+                    }
+                }
+                $overrides['results'] = $results;
+            }
+        }
+
+        // 3. Override featuredTlds
+        if (isset($vars['featuredTlds']) && is_array($vars['featuredTlds'])) {
+            $currencyId = (int)($_SESSION['currency'] ?? 1);
+            $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+            if ($currencyObj) {
+                $featuredTldsVar = $vars['featuredTlds'];
+                foreach ($featuredTldsVar as $num => $tldinfo) {
+                    $tld = is_array($tldinfo) ? ($tldinfo['tld'] ?? '') : ($tldinfo->tld ?? '');
+                    $cleanTld = '.' . ltrim($tld, '.');
+                    $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $cleanTld)->first();
+                    if (!$domainTemplate) {
+                        unset($featuredTldsVar[$num]);
+                        continue;
+                    }
+
+                    $domainId = $domainTemplate->id;
+                    if (!isset($pricingOverrides['domains'][$domainId])) {
+                        unset($featuredTldsVar[$num]);
+                        continue;
+                    }
+
+                    // Apply price overrides only if price_override is enabled
+                    if ($brand->price_override) {
+                        $domainOverrides = $pricingOverrides['domains'][$domainId]['pricing'] ?? [];
+                        $rates = $domainOverrides[$currencyId] ?? [];
+
+                        if (is_array($tldinfo)) {
+                            if (!empty($rates) && isset($tldinfo['register']) && is_object($tldinfo['register'])) {
+                                $regperiod = (int)($tldinfo['period'] ?? 1);
+                                $key = 'register' . $regperiod;
+                                if (isset($rates[$key]) && $rates[$key] !== '' && $rates[$key] >= 0) {
+                                    $featuredTldsVar[$num]['register'] = new \WHMCS\View\Formatter\Price((float)$rates[$key], $currencyObj);
+                                }
+                            }
+                        } else if (is_object($tldinfo)) {
+                            if (!empty($rates) && isset($tldinfo->register) && is_object($tldinfo->register)) {
+                                $regperiod = (int)($tldinfo->period ?? 1);
+                                $key = 'register' . $regperiod;
+                                if (isset($rates[$key]) && $rates[$key] !== '' && $rates[$key] >= 0) {
+                                    $tldinfo->register = new \WHMCS\View\Formatter\Price((float)$rates[$key], $currencyObj);
+                                    $featuredTldsVar[$num] = $tldinfo;
+                                }
+                            }
+                        }
+                    }
+                }
+                $featuredTldsVar = array_values($featuredTldsVar);
+                $overrides['featuredTlds'] = $featuredTldsVar;
+            }
+        }
+
+        // 3b. Override and filter spotlightTlds
+        if (isset($vars['spotlightTlds']) && is_array($vars['spotlightTlds'])) {
+            $currencyId = (int)($_SESSION['currency'] ?? 1);
+            $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+            $spotlightTldsVar = $vars['spotlightTlds'];
+            foreach ($spotlightTldsVar as $key => $data) {
+                $tld = is_array($data) ? ($data['tld'] ?? '') : ($data->tld ?? '');
+                if (!$tld) {
+                    $tld = $key;
+                }
+                $cleanTld = '.' . ltrim($tld, '.');
+                $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $cleanTld)->first();
+                if (!$domainTemplate) {
+                    unset($spotlightTldsVar[$key]);
+                    continue;
+                }
+                $domainId = $domainTemplate->id;
+                if (!isset($pricingOverrides['domains'][$domainId])) {
+                    unset($spotlightTldsVar[$key]);
+                    continue;
+                }
+
+                // Apply price overrides only if price_override is enabled
+                if ($brand->price_override) {
+                    $domainOverrides = $pricingOverrides['domains'][$domainId]['pricing'] ?? [];
+                    $rates = $domainOverrides[$currencyId] ?? [];
+                    if (!empty($rates) && $currencyObj) {
+                        $regperiod = is_array($data) ? (int)($data['period'] ?? 1) : (int)($data->period ?? 1);
+                        $priceKey = 'register' . $regperiod;
+                        if (isset($rates[$priceKey]) && $rates[$priceKey] !== '' && (float)$rates[$priceKey] >= 0) {
+                            $newPrice = (float)$rates[$priceKey];
+                            $priceObj = new \WHMCS\View\Formatter\Price($newPrice, $currencyObj);
+                            if (is_array($data)) {
+                                $spotlightTldsVar[$key]['register'] = $priceObj;
+                            } else if (is_object($data)) {
+                                $data->register = $priceObj;
+                                $spotlightTldsVar[$key] = $data;
+                            }
+                        }
+                    }
+                }
+            }
+            if (array_keys($spotlightTldsVar) === range(0, count($spotlightTldsVar) - 1)) {
+                $spotlightTldsVar = array_values($spotlightTldsVar);
+            }
+            $overrides['spotlightTlds'] = $spotlightTldsVar;
+        }
+
+        // 4. Override domains in the cart (for the view cart page dropdowns and prices)
+        if (isset($vars['domains']) && is_array($vars['domains'])) {
+            $currencyId = (int)($_SESSION['currency'] ?? 0);
+            if ($currencyId <= 0) {
+                $currencyId = (int)Capsule::table('tblcurrencies')->where('default', 1)->value('id') ?: 1;
+            }
+            $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+
+            if ($currencyObj) {
+                $cartDomains = $vars['domains'];
+                foreach ($cartDomains as $i => $domain) {
+                    $domainName = is_array($domain) ? ($domain['domain'] ?? '') : ($domain->domain ?? '');
+                    if (!$domainName || strpos($domainName, '.') === false) continue;
+
+                    $dotPos = strpos($domainName, '.');
+                    $tld = substr($domainName, $dotPos);
+                    $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $tld)->first();
+                    if (!$domainTemplate) continue;
+
+                    $domainId = $domainTemplate->id;
+                    if ($brand->price_override) {
+                        $domainOverrides = $pricingOverrides['domains'][$domainId]['pricing'] ?? [];
+                        if (empty($domainOverrides)) continue;
+
+                    $rates = $domainOverrides[$currencyId] ?? [];
+                    if (empty($rates)) continue;
+
+                    $regperiod = is_array($domain) ? (int)($domain['regperiod'] ?? 1) : (int)($domain->regperiod ?? 1);
+                    $type = is_array($domain) ? ($domain['type'] ?? 'register') : ($domain->type ?? 'register');
+
+                    $priceKey = $type . $regperiod;
+                    $renewKey = 'renew' . $regperiod;
+
+                    // Override price
+                    if (isset($rates[$priceKey]) && $rates[$priceKey] !== '' && (float)$rates[$priceKey] >= 0) {
+                        $newPrice = (float)$rates[$priceKey];
+                        $priceFormatted = formatCurrency($newPrice, $currencyId);
+                        if (is_array($domain)) {
+                            $cartDomains[$i]['price'] = $priceFormatted;
+                        } else {
+                            $domain->price = $priceFormatted;
+                        }
+                    }
+
+                    // Override renewal price
+                    if (isset($rates[$renewKey]) && $rates[$renewKey] !== '' && (float)$rates[$renewKey] >= 0) {
+                        $newRenewPrice = (float)$rates[$renewKey];
+                        $renewPriceObj = new \WHMCS\View\Formatter\Price($newRenewPrice, $currencyObj);
+                        if (is_array($domain)) {
+                            $cartDomains[$i]['renewprice'] = $renewPriceObj;
+                        } else {
+                            $domain->renewprice = $renewPriceObj;
+                        }
+                    }
+
+                    // Override the pricing list (for the dropdown)
+                    $pricingList = is_array($domain) ? ($domain['pricing'] ?? []) : ($domain->pricing ?? []);
+                    if (is_array($pricingList)) {
+                        foreach ($pricingList as $years => $prices) {
+                            $y = (int)$years;
+                            $yRegKey = 'register' . $y;
+                            $yTransKey = 'transfer' . $y;
+                            $yRenewKey = 'renew' . $y;
+
+                            $yRegPrice = isset($rates[$yRegKey]) && $rates[$yRegKey] !== '' && (float)$rates[$yRegKey] >= 0 ? (float)$rates[$yRegKey] : null;
+                            $yTransPrice = isset($rates[$yTransKey]) && $rates[$yTransKey] !== '' && (float)$rates[$yTransKey] >= 0 ? (float)$rates[$yTransKey] : null;
+                            $yRenewPrice = isset($rates[$yRenewKey]) && $rates[$yRenewKey] !== '' && (float)$rates[$yRenewKey] >= 0 ? (float)$rates[$yRenewKey] : null;
+
+                            if (is_array($domain)) {
+                                if ($yRegPrice !== null) {
+                                    $cartDomains[$i]['pricing'][$years]['register'] = formatCurrency($yRegPrice, $currencyId);
+                                }
+                                if ($yTransPrice !== null) {
+                                    $cartDomains[$i]['pricing'][$years]['transfer'] = formatCurrency($yTransPrice, $currencyId);
+                                }
+                                if ($yRenewPrice !== null) {
+                                    $cartDomains[$i]['pricing'][$years]['renew'] = formatCurrency($yRenewPrice, $currencyId);
+                                }
+                            } else {
+                                if ($yRegPrice !== null && isset($domain->pricing[$years])) {
+                                    $domain->pricing[$years]['register'] = formatCurrency($yRegPrice, $currencyId);
+                                }
+                                if ($yTransPrice !== null && isset($domain->pricing[$years])) {
+                                    $domain->pricing[$years]['transfer'] = formatCurrency($yTransPrice, $currencyId);
+                                }
+                                if ($yRenewPrice !== null && isset($domain->pricing[$years])) {
+                                    $domain->pricing[$years]['renew'] = formatCurrency($yRenewPrice, $currencyId);
+                                }
+                            }
+                        }
+                        if (is_object($domain)) {
+                            $cartDomains[$i] = $domain;
+                        }
+                    }
+                    }
+                }
+                $overrides['domains'] = $cartDomains;
+            }
+        }
+
+        // Apply Smarty overrides
+        if (!empty($overrides)) {
+            if (isset($GLOBALS['smarty']) && is_object($GLOBALS['smarty']) && method_exists($GLOBALS['smarty'], 'assign')) {
+                foreach ($overrides as $key => $value) {
+                    $GLOBALS['smarty']->assign($key, $value);
+                }
+            }
+            return $overrides;
+        }
+
+    } catch (\Exception $e) {
+        // Silently fail
+    }
+});
+
+/**
+ * Client Area Footer - Domain Search Price Override via JavaScript
+ * Intercepts WHMCS /domain/check AJAX response and replaces prices with brand pricing
+ */
+add_hook('ClientAreaFooterOutput', 10, function ($vars) {
+    $brand = get_multibrand_active_brand();
+    if (!$brand || (!$brand->price_override && !$brand->products_branding)) {
+        return '';
+    }
+
+    $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+
+    // Build TLD -> price map for JavaScript (keyed by TLD without dot, e.g. "com")
+    $currencyId = (int)($_SESSION['currency'] ?? 0);
+    if ($currencyId <= 0) {
+        $currencyId = (int)Capsule::table('tblcurrencies')->where('default', 1)->value('id') ?: 1;
+    }
+    $currencyObj = \WHMCS\Billing\Currency::find($currencyId);
+    if (!$currencyObj) {
+        return '';
+    }
+
+    $currencyPrefix = $currencyObj->prefix ?? '';
+    $currencySuffix = $currencyObj->suffix ?? '';
+
+    $tldPrices = [];
+    if (isset($pricingOverrides['domains']) && is_array($pricingOverrides['domains'])) {
+        foreach ($pricingOverrides['domains'] as $domainId => $domData) {
+            try {
+                $tldRow = Capsule::table('tbldomainpricing')->where('id', $domainId)->first();
+                if (!$tldRow) continue;
+
+                $rates = $domData['pricing'][$currencyId] ?? [];
+                $tldKey = ltrim($tldRow->extension, '.'); // e.g. "com"
+                $periods = [];
+                if ($brand->price_override) {
+                    for ($p = 1; $p <= 10; $p++) {
+                        $regKey = 'register' . $p;
+                        $transferKey = 'transfer' . $p;
+                        $renewKey = 'renew' . $p;
+
+                        $periodPricing = [];
+                        if (isset($rates[$regKey]) && $rates[$regKey] !== '' && (float)$rates[$regKey] >= 0) {
+                            $periodPricing['register'] = (float)$rates[$regKey];
+                        }
+                        if (isset($rates[$transferKey]) && $rates[$transferKey] !== '' && (float)$rates[$transferKey] >= 0) {
+                            $periodPricing['transfer'] = (float)$rates[$transferKey];
+                        }
+                        if (isset($rates[$renewKey]) && $rates[$renewKey] !== '' && (float)$rates[$renewKey] >= 0) {
+                            $periodPricing['renew'] = (float)$rates[$renewKey];
+                        }
+
+                        if (!empty($periodPricing)) {
+                            $periods[$p] = $periodPricing;
+                        }
+                    }
+                }
+                $tldPrices[$tldKey] = $periods;
+            } catch (\Exception $e) {}
+        }
+    }
+
+    $jsonPrices  = json_encode($tldPrices);
+    $jsonPrefix  = json_encode($currencyPrefix);
+    $jsonSuffix  = json_encode($currencySuffix);
+
+    return "
+<script>
+(function() {
+    var mbPrices  = {$jsonPrices};
+    var mbPrefix  = {$jsonPrefix};
+    var mbSuffix  = {$jsonSuffix};
+
+    /* Format a price like WHMCS does: prefix + amount + suffix */
+    function mbFormat(amount) {
+        var n = parseFloat(amount).toFixed(2);
+        var out = '';
+        if (mbPrefix) out += mbPrefix;
+        out += n;
+        if (mbSuffix) out += mbSuffix;
+        return out.trim();
+    }
+
+    /* Get the TLD from a domain string, e.g. 'example.com' -> 'com' */
+    function mbTld(domain) {
+        if (!domain) return '';
+        var idx = domain.lastIndexOf('.');
+        return idx >= 0 ? domain.substring(idx + 1).toLowerCase() : '';
+    }
+
+    /* Get brand price for a TLD, registration period, and price type */
+    function mbGetPrice(tld, period, type) {
+        tld = (tld || '').toLowerCase().replace(/^\.+/, '');
+        period = parseInt(period) || 1;
+        type = type || 'register';
+        
+        if (mbPrices[tld] && mbPrices[tld][period] && mbPrices[tld][period][type] !== undefined) {
+            return mbPrices[tld][period][type];
+        }
+        // Fallback: try period 1
+        if (mbPrices[tld] && mbPrices[tld][1] && mbPrices[tld][1][type] !== undefined) {
+            return mbPrices[tld][1][type];
+        }
+        return null;
+    }
+
+    /* Modify the /domain/check JSON response to inject brand prices */
+    function mbPatchDomainCheckResponse(responseText) {
+        try {
+            var data = JSON.parse(responseText);
+            if (!data || !data.result) return null;
+
+            var changed = false;
+            var keys = Object.keys(data.result);
+            keys.forEach(function(key) {
+                var domain = data.result[key];
+                if (!domain || typeof domain !== 'object') return;
+                if (domain.error) return;
+
+                var tld = mbTld(domain.domainName || '');
+                if (!tld) return;
+
+                if (mbPrices[tld] === undefined) {
+                    domain.isAvailable = false;
+                    domain.status = 'unavailable';
+                    domain.pricing = null;
+                    changed = true;
+                    return;
+                }
+
+                if (!domain.pricing || typeof domain.pricing === 'string') return;
+
+                var newPricing = {};
+                Object.keys(domain.pricing).forEach(function(period) {
+                    var p = parseInt(period);
+                    var originalPeriodPricing = domain.pricing[period] || {};
+                    
+                    var regPrice = mbGetPrice(tld, p, 'register');
+                    var transPrice = mbGetPrice(tld, p, 'transfer');
+                    var renewPrice = mbGetPrice(tld, p, 'renew');
+
+                    newPricing[period] = {
+                        register: regPrice !== null ? mbFormat(regPrice) : (originalPeriodPricing.register || ''),
+                        transfer: transPrice !== null ? mbFormat(transPrice) : (originalPeriodPricing.transfer || ''),
+                        renew: renewPrice !== null ? mbFormat(renewPrice) : (originalPeriodPricing.renew || '')
+                    };
+                    
+                    if (regPrice !== null || transPrice !== null || renewPrice !== null) {
+                        changed = true;
+                    }
+                });
+                data.result[key].pricing = newPricing;
+            });
+
+            if (changed) {
+                console.log(\"[Multibrand] Overrode domain pricing in check response:\", data);
+                return JSON.stringify(data);
+            }
+            return null;
+        } catch(e) {
+            console.error(\"[Multibrand] Error patching domain check response:\", e);
+            return null;
+        }
+    }
+
+    /* Intercept XMLHttpRequest on the prototype chain - clean, global, robust */
+    try {
+        var descText = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'responseText');
+        var descResponse = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'response');
+
+        if (descText && descText.configurable) {
+            var origGetText = descText.get;
+            Object.defineProperty(XMLHttpRequest.prototype, 'responseText', {
+                get: function() {
+                    var val = origGetText.call(this);
+                    if (this._isDomainCheck) {
+                        var patched = mbPatchDomainCheckResponse(val);
+                        return patched !== null ? patched : val;
+                    }
+                    return val;
+                },
+                configurable: true,
+                enumerable: true
+            });
+        }
+
+        if (descResponse && descResponse.configurable) {
+            var origGetResponse = descResponse.get;
+            Object.defineProperty(XMLHttpRequest.prototype, 'response', {
+                get: function() {
+                    var val = origGetResponse.call(this);
+                    if (this._isDomainCheck) {
+                        var rawText = '';
+                        try {
+                            rawText = this.responseText;
+                        } catch(e) {
+                            rawText = typeof val === 'string' ? val : JSON.stringify(val);
+                        }
+                        var patchedText = mbPatchDomainCheckResponse(rawText);
+                        if (patchedText !== null) {
+                            if (this.responseType === 'json') {
+                                try {
+                                    return JSON.parse(patchedText);
+                                } catch(e) {
+                                    return patchedText;
+                                }
+                            }
+                            return patchedText;
+                        }
+                    }
+                    return val;
+                },
+                configurable: true,
+                enumerable: true
+            });
+        }
+
+        var origOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            var urlStr = url || '';
+            this._isDomainCheck = (urlStr.indexOf('/domain/check') !== -1 || urlStr.indexOf('domain%2Fcheck') !== -1);
+            if (this._isDomainCheck) {
+                console.log(\"[Multibrand] Intercepted domain check AJAX request:\", urlStr);
+            }
+            return origOpen.apply(this, arguments);
+        };
+    } catch(err) {
+        console.error(\"[Multibrand] Failed to hook XMLHttpRequest prototype:\", err);
+    }
+
+    /* ---- Backup DOM approach: override span.price after it's written ---- */
+    var lastSearchedDomain = '';
+
+    document.addEventListener('submit', function(e) {
+        var form = e.target;
+        if (!form) return;
+        var input = form.querySelector('input[name=\"domain\"]') || form.querySelector('#inputDomain') || form.querySelector('#domain');
+        if (input) lastSearchedDomain = (input.value || '').toLowerCase().trim();
+    }, true);
+
+    document.addEventListener('DOMContentLoaded', function() {
+        var domainInputs = document.querySelectorAll('input[name=\"domain\"], #inputDomain, #domain, .domain-search-input');
+        domainInputs.forEach(function(inp) {
+            inp.addEventListener('change', function() { lastSearchedDomain = (this.value || '').toLowerCase().trim(); });
+            inp.addEventListener('keyup', function() { lastSearchedDomain = (this.value || '').toLowerCase().trim(); });
+        });
+    });
+
+    function overridePriceSpan() {
+        var spans = document.querySelectorAll('p.domain-price span.price, .domain-price .price, #primaryLookupResult .domain-price span.price');
+        spans.forEach(function(span) {
+            if (span.getAttribute('data-mb') === '1') return;
+            var txt = (span.textContent || span.innerHTML || '').trim();
+            if (!txt) return;
+
+            var domain = lastSearchedDomain;
+            if (!domain) {
+                var domEl = document.querySelector('#resultDomain, input[name=\"domain\"], .domain-available strong');
+                if (domEl) domain = (domEl.value || domEl.textContent || '').trim().toLowerCase();
+            }
+
+            var tld = mbTld(domain);
+            if (!tld) return;
+            var brandPrice = mbGetPrice(tld, 1, 'register');
+            if (brandPrice === null) return;
+
+            var formatted = mbFormat(brandPrice);
+            if (txt !== formatted) {
+                span.textContent = formatted;
+                span.setAttribute('data-mb', '1');
+            }
+        });
+
+        var spotlightPrices = document.querySelectorAll('.spotlight-tld .available.price, .featured-tld .price');
+        spotlightPrices.forEach(function(el) {
+            if (el.getAttribute('data-mb') === '1') return;
+            var txt = (el.textContent || '').trim();
+            if (!txt) return;
+            var parent = el.closest('[id^=\"spotlight\"]') || el.closest('[id^=\"featured\"]');
+            var tld = '';
+            if (parent) tld = parent.id.replace('spotlight', '').replace('featured', '').toLowerCase();
+            if (!tld) return;
+            var brandPrice = mbGetPrice(tld, 1, 'register');
+            if (brandPrice === null) return;
+            var formatted = mbFormat(brandPrice);
+            if (txt !== formatted) {
+                el.textContent = formatted;
+                el.setAttribute('data-mb', '1');
+            }
+        });
+    }
+
+    var mo = new MutationObserver(function(muts) {
+        var needsCheck = false;
+        muts.forEach(function(m) {
+            if (m.type === 'childList' || (m.type === 'characterData')) needsCheck = true;
+        });
+        if (needsCheck) {
+            setTimeout(overridePriceSpan, 0);
+            setTimeout(overridePriceSpan, 200);
+            setTimeout(overridePriceSpan, 600);
+        }
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+
+    window.mbBrandPrices = mbPrices;
+    window.mbOverride = overridePriceSpan;
+})();
+</script>
+";
+});
+
 
 /**
  * Client Area Primary Navbar Hook
@@ -3770,18 +5568,67 @@ add_hook('AdminAreaClientSummaryPage', 1, function ($vars) {
             ->where('userid', $userid)
             ->pluck('id')
             ->toArray();
-            
+
         if (!empty($clientServiceIds)) {
             $sBrands = Capsule::table('mod_multibrand_service_brands')
                 ->join('mod_multibrand_brands', 'mod_multibrand_service_brands.brand_id', '=', 'mod_multibrand_brands.id')
                 ->whereIn('mod_multibrand_service_brands.service_id', $clientServiceIds)
                 ->select('mod_multibrand_service_brands.service_id', 'mod_multibrand_brands.brand_name', 'mod_multibrand_brands.brand_color')
                 ->get();
-                
+
             foreach ($sBrands as $sb) {
                 $serviceBrandsMap[$sb->service_id] = [
                     'brand_name' => $sb->brand_name,
                     'brand_color' => $sb->brand_color ?: '#666'
+                ];
+            }
+        }
+    } catch (\Exception $e) {}
+
+    // Fetch all addon brand mappings for this client
+    $addonBrandsMap = [];
+    try {
+        $clientAddonIds = Capsule::table('tblhostingaddons')
+            ->join('tblhosting', 'tblhostingaddons.hostingid', '=', 'tblhosting.id')
+            ->where('tblhosting.userid', $userid)
+            ->pluck('tblhostingaddons.id')
+            ->toArray();
+
+        if (!empty($clientAddonIds)) {
+            $aBrands = Capsule::table('mod_multibrand_addon_brands')
+                ->join('mod_multibrand_brands', 'mod_multibrand_addon_brands.brand_id', '=', 'mod_multibrand_brands.id')
+                ->whereIn('mod_multibrand_addon_brands.addon_id', $clientAddonIds)
+                ->select('mod_multibrand_addon_brands.addon_id', 'mod_multibrand_brands.brand_name', 'mod_multibrand_brands.brand_color')
+                ->get();
+
+            foreach ($aBrands as $ab) {
+                $addonBrandsMap[$ab->addon_id] = [
+                    'brand_name' => $ab->brand_name,
+                    'brand_color' => $ab->brand_color ?: '#666'
+                ];
+            }
+        }
+    } catch (\Exception $e) {}
+
+    // Fetch all domain brand mappings for this client
+    $domainBrandsMap = [];
+    try {
+        $clientDomainIds = Capsule::table('tbldomains')
+            ->where('userid', $userid)
+            ->pluck('id')
+            ->toArray();
+
+        if (!empty($clientDomainIds)) {
+            $dBrands = Capsule::table('mod_multibrand_domain_brands')
+                ->join('mod_multibrand_brands', 'mod_multibrand_domain_brands.brand_id', '=', 'mod_multibrand_brands.id')
+                ->whereIn('mod_multibrand_domain_brands.domain_id', $clientDomainIds)
+                ->select('mod_multibrand_domain_brands.domain_id', 'mod_multibrand_brands.brand_name', 'mod_multibrand_brands.brand_color')
+                ->get();
+
+            foreach ($dBrands as $db) {
+                $domainBrandsMap[$db->domain_id] = [
+                    'brand_name' => $db->brand_name,
+                    'brand_color' => $db->brand_color ?: '#666'
                 ];
             }
         }
@@ -3794,14 +5641,14 @@ add_hook('AdminAreaClientSummaryPage', 1, function ($vars) {
             ->where('userid', $userid)
             ->pluck('id')
             ->toArray();
-            
+
         if (!empty($clientInvoiceIds)) {
             $iBrands = Capsule::table('mod_multibrand_invoice_brands')
                 ->join('mod_multibrand_brands', 'mod_multibrand_invoice_brands.brand_id', '=', 'mod_multibrand_brands.id')
                 ->whereIn('mod_multibrand_invoice_brands.invoice_id', $clientInvoiceIds)
                 ->select('mod_multibrand_invoice_brands.invoice_id', 'mod_multibrand_brands.brand_name', 'mod_multibrand_brands.brand_color')
                 ->get();
-                
+
             foreach ($iBrands as $ib) {
                 $invoiceBrandsMap[$ib->invoice_id] = [
                     'brand_name' => $ib->brand_name,
@@ -3815,7 +5662,7 @@ add_hook('AdminAreaClientSummaryPage', 1, function ($vars) {
     <script>
         $(document).ready(function() {
             var brandTags = \"" . addslashes($tagsHtml) . "\";
-            
+
             // Find email link or email td cell to place badge inside the cell
             var emailLink = $('a[href^=\"mailto:\"]');
             if (emailLink.length) {
@@ -3830,158 +5677,121 @@ add_hook('AdminAreaClientSummaryPage', 1, function ($vars) {
                     }
                 }
             }
-            
-            // Service & Invoice Brand mappings
+
+            // Service, Addon, Domain & Invoice Brand mappings
             var serviceBrands = " . json_encode($serviceBrandsMap) . ";
+            var addonBrands = " . json_encode($addonBrandsMap) . ";
+            var domainBrands = " . json_encode($domainBrandsMap) . ";
             var invoiceBrands = " . json_encode($invoiceBrandsMap) . ";
-            
+
+            function decorateTable(table, brandsMap, type) {
+                if (!table.length) return;
+
+                var idColIndex = -1;
+                var isInvoice = false;
+                
+                // Find ID column index
+                table.find('th').each(function(index) {
+                    var text = $(this).text().trim();
+                    if (text === 'ID') {
+                        idColIndex = index;
+                    } else if (text === 'Invoice #') {
+                        idColIndex = index;
+                        isInvoice = true;
+                    }
+                });
+
+                if (idColIndex !== -1) {
+                    // Add \"Brand\" header to each header row if not present
+                    table.find('thead tr, tr:first').each(function() {
+                        var headerRow = $(this);
+                        if (headerRow.find('th').length > 0) {
+                            var brandHeader = headerRow.find('th.mb-brand-header');
+                            if (brandHeader.length === 0) {
+                                var lastTh = headerRow.find('th').last();
+                                lastTh.after('<th class=\"text-center mb-brand-header\" style=\"font-weight: bold; width: 120px;\">Brand</th>');
+                            }
+                        }
+                    });
+
+                    // Loop over each row in tbody
+                    table.find('tbody tr').each(function() {
+                        var row = $(this);
+
+                        // Prevent duplicate processing of the same row
+                        if (row.hasClass('mb-processed-' + type)) {
+                            return;
+                        }
+
+                        var cells = row.find('td');
+
+                        // Handle empty table placeholder (colspan)
+                        if (cells.length === 1 && cells.first().attr('colspan')) {
+                            var currentColspan = parseInt(cells.first().attr('colspan'), 10);
+                            cells.first().attr('colspan', currentColspan + 1);
+                            row.addClass('mb-processed-' + type);
+                            return;
+                        }
+
+                        if (cells.length > idColIndex) {
+                            var rawId = cells.eq(idColIndex).text().trim();
+                            var id = isInvoice ? rawId.replace(/[^0-9]/g, '') : rawId;
+                            var badge = '';
+
+                            if (id && brandsMap[id]) {
+                                var brand = brandsMap[id];
+                                var name = brand.brand_name;
+                                var color = brand.brand_color || '#666';
+                                badge = \"<span class='label' style='background-color: \" + color + \"; color: #fff; font-size: 0.8em; padding: 2px 6px; border-radius: 3px; font-weight: bold; vertical-align: middle;'>\" + name + \"</span>\";
+                            }
+
+                            // Insert the new cell after the last cell (actions / edit)
+                            var lastCell = cells.last();
+                            if (row.find('.mb-brand-cell').length === 0) {
+                                lastCell.after('<td class=\"text-center mb-brand-cell\" style=\"vertical-align: middle;\">' + badge + '</td>');
+                            } else {
+                                row.find('.mb-brand-cell').html(badge);
+                            }
+                            row.addClass('mb-processed-' + type);
+                        }
+                    });
+                }
+            }
+
             function decorateClientSummaryTables() {
                 $('table').each(function() {
                     var table = $(this);
                     
-                    // 1. PRODUCTS / SERVICES TABLE DECORATION
-                    var productCol = table.find('th:contains(\"Product/Service\")');
-                    if (productCol.length > 0) {
-                        var idColIndex = -1;
-                        
-                        // Find ID column index
-                        table.find('th').each(function(index) {
-                            var text = $(this).text().trim();
-                            if (text === 'ID') {
-                                idColIndex = index;
-                            }
-                        });
-                        
-                        if (idColIndex !== -1) {
-                            // Add \"Brand\" header to each header row if not present
-                            table.find('thead tr, tr:first').each(function() {
-                                var headerRow = $(this);
-                                if (headerRow.find('th').length > 0) {
-                                    var brandHeader = headerRow.find('th:contains(\"Brand\")');
-                                    if (brandHeader.length === 0) {
-                                        var lastTh = headerRow.find('th').last();
-                                        lastTh.after('<th class=\"text-center mb-brand-header\" style=\"font-weight: bold;\">Brand</th>');
-                                    }
-                                }
-                            });
-                            
-                            // Loop over each row in tbody
-                            table.find('tbody tr').each(function() {
-                                var row = $(this);
-                                
-                                // Prevent duplicate processing of the same row
-                                if (row.hasClass('mb-processed-row')) {
-                                    return;
-                                }
-                                
-                                var cells = row.find('td');
-                                
-                                // Handle empty table placeholder (colspan)
-                                if (cells.length === 1 && cells.first().attr('colspan')) {
-                                    var currentColspan = parseInt(cells.first().attr('colspan'), 10);
-                                    cells.first().attr('colspan', currentColspan + 1);
-                                    row.addClass('mb-processed-row');
-                                    return;
-                                }
-                                
-                                if (cells.length > idColIndex) {
-                                    var serviceId = cells.eq(idColIndex).text().trim();
-                                    var badge = '';
-                                    
-                                    if (serviceId && serviceBrands[serviceId]) {
-                                        var brand = serviceBrands[serviceId];
-                                        var name = brand.brand_name;
-                                        var color = brand.brand_color || '#666';
-                                        badge = \"<span class='label' style='background-color: \" + color + \"; color: #fff; font-size: 0.8em; padding: 2px 6px; border-radius: 3px; font-weight: bold; vertical-align: middle;'>\" + name + \"</span>\";
-                                    }
-                                    
-                                    // Insert the new cell after the last actions cell
-                                    var lastCell = cells.last();
-                                    lastCell.after('</td class=\"text-center mb-brand-cell\" style=\"vertical-align: middle;\">' + badge + '</td>');
-                                    row.addClass('mb-processed-row');
-                                }
-                            });
-                        }
+                    // 1. PRODUCTS / SERVICES TABLE
+                    if (table.find('th:contains(\"Product/Service\")').length > 0) {
+                        decorateTable(table, serviceBrands, 'services');
                     }
                     
-                    // 2. INVOICES TABLE DECORATION
-                    var invoiceCol = table.find('th:contains(\"Invoice #\")');
-                    if (invoiceCol.length > 0) {
-                        var idColIndex = -1;
-                        
-                        // Find \"Invoice #\" column index
-                        table.find('th').each(function(index) {
-                            var text = $(this).text().trim();
-                            if (text === 'Invoice #') {
-                                idColIndex = index;
-                            }
-                        });
-                        
-                        if (idColIndex !== -1) {
-                            // Add \"Brand\" header to each header row if not present
-                            table.find('thead tr, tr:first').each(function() {
-                                var headerRow = $(this);
-                                if (headerRow.find('th').length > 0) {
-                                    var brandHeader = headerRow.find('th:contains(\"Brand\")');
-                                    if (brandHeader.length === 0) {
-                                        var lastTh = headerRow.find('th').last();
-                                        lastTh.after('<th class=\"text-center mb-brand-header\" style=\"font-weight: bold;\">Brand</th>');
-                                    }
-                                }
-                            });
-                            
-                            // Loop over each row in tbody
-                            table.find('tbody tr').each(function() {
-                                var row = $(this);
-                                
-                                // Prevent duplicate processing of the same row
-                                if (row.hasClass('mb-processed-row')) {
-                                    return;
-                                }
-                                
-                                var cells = row.find('td');
-                                
-                                // Handle empty table placeholder (colspan)
-                                if (cells.length === 1 && cells.first().attr('colspan')) {
-                                    var currentColspan = parseInt(cells.first().attr('colspan'), 10);
-                                    cells.first().attr('colspan', currentColspan + 1);
-                                    row.addClass('mb-processed-row');
-                                    return;
-                                }
-                                
-                                if (cells.length > idColIndex) {
-                                    var invoiceIdText = cells.eq(idColIndex).text().trim();
-                                    
-                                    // Extract only numeric invoice ID
-                                    var invoiceId = invoiceIdText.replace(/[^0-9]/g, '');
-                                    
-                                    var badge = '';
-                                    if (invoiceId && invoiceBrands[invoiceId]) {
-                                        var brand = invoiceBrands[invoiceId];
-                                        var name = brand.brand_name;
-                                        var color = brand.brand_color || '#666';
-                                        badge = \"<span class='label' style='background-color: \" + color + \"; color: #fff; font-size: 0.8em; padding: 2px 6px; border-radius: 3px; font-weight: bold; vertical-align: middle;'>\" + name + \"</span>\";
-                                    }
-                                    
-                                    // Insert the new cell after the last actions cell
-                                    var lastCell = cells.last();
-                                    lastCell.after('<td class=\"text-center mb-brand-cell\" style=\"vertical-align: middle;\">' + badge + '</td>');
-                                    row.addClass('mb-processed-row');
-                                }
-                            });
-                        }
+                    // 2. ADDONS TABLE
+                    if (table.find('th:contains(\"Name\")').length > 0 && table.closest('table').find('tr:first').text().indexOf('Addons') !== -1) {
+                        decorateTable(table, addonBrands, 'addons');
+                    }
+                    
+                    // 3. DOMAINS TABLE
+                    if (table.find('th:contains(\"Domain\")').length > 0 && table.find('th:contains(\"Registrar\")').length > 0) {
+                        decorateTable(table, domainBrands, 'domains');
+                    }
+
+                    // 4. INVOICES TABLE
+                    if (table.find('th:contains(\"Invoice #\")').length > 0) {
+                        decorateTable(table, invoiceBrands, 'invoices');
                     }
                 });
             }
-            
+
             // Run initially
             decorateClientSummaryTables();
-            
+
             // Re-run on datatables page changes, searches, sorting
             $(document).on('draw.dt', 'table', function() {
                 decorateClientSummaryTables();
             });
-            
+
             // Re-run on general AJAX loads / tab switches
             $(document).ajaxSuccess(function() {
                 decorateClientSummaryTables();
@@ -4104,9 +5914,9 @@ add_hook('AdminAreaFooterOutput', 2, function ($vars) {
         'index',
         'clientsprofile',
         'clientsinvoices',
-        'clientsadd'
+        'clientsadd',
+        'clientsdomainslist'
     ];
-
     if (!in_array($vars['filename'], $supportedFilenames)) {
         return '';
     }
@@ -4185,13 +5995,16 @@ add_hook('AdminAreaFooterOutput', 2, function ($vars) {
                 $brandsList = $filteredBrandsList;
             }
         }
-
         // Dynamically map new WHMCS route paths for services listing to traditional filename
         if ($filename == 'index') {
             $isServicesRoute = (isset($_GET['rp']) && $_GET['rp'] == '/admin/services') || 
                                (isset($_SERVER['REQUEST_URI']) && (strpos($_SERVER['REQUEST_URI'], '/admin/services') !== false || strpos($_SERVER['REQUEST_URI'], '/services') !== false));
+            $isDomainsRoute = (isset($_GET['rp']) && (strpos($_GET['rp'], '/admin/domains') !== false)) || 
+                              (isset($_SERVER['REQUEST_URI']) && strpos($_SERVER['REQUEST_URI'], '/admin/domains') !== false);
             if ($isServicesRoute) {
                 $filename = 'clientshostinglist';
+            } elseif ($isDomainsRoute) {
+                $filename = 'clientsdomains';
             } else {
                 return '';
             }
@@ -4402,6 +6215,123 @@ add_hook('AdminAreaFooterOutput', 2, function ($vars) {
             ";
         }
 
+        // -- Domain Edit Page --
+        if ($filename == 'clientsdomains' && basename($_SERVER['SCRIPT_NAME'] ?? '') == 'clientsdomains.php') {
+            $domainId = (int)($_REQUEST['id'] ?? 0);
+            $explicitBrandId = 0;
+            $clientId = 0;
+            if ($domainId > 0) {
+                $explicitDomainBrand = Capsule::table('mod_multibrand_domain_brands')
+                    ->where('domain_id', $domainId)
+                    ->first();
+                if ($explicitDomainBrand) {
+                    $explicitBrandId = $explicitDomainBrand->brand_id;
+                }
+                try {
+                    $domain = Capsule::table('tbldomains')->where('id', $domainId)->first();
+                    if ($domain) {
+                        $clientId = (int)$domain->userid;
+                    }
+                } catch (\Exception $e) {}
+            }
+
+            if ($clientId === 0) {
+                $clientId = (int)($_REQUEST['userid'] ?? $_REQUEST['id'] ?? 0);
+            }
+
+            $assignedBrandIds = [];
+            if ($clientId > 0) {
+                try {
+                    $assignedBrandIds = Capsule::table('mod_multibrand_client_brands')
+                        ->where('client_id', $clientId)
+                        ->pluck('brand_id')
+                        ->toArray();
+                } catch (\Exception $e) {}
+            }
+
+            $filteredBrandsList = [];
+            if (!empty($assignedBrandIds)) {
+                foreach ($brandsList as $brand) {
+                    if (in_array($brand['id'], $assignedBrandIds)) {
+                        $filteredBrandsList[] = $brand;
+                    }
+                }
+            }
+            if (empty($filteredBrandsList)) {
+                $filteredBrandsList = $brandsList;
+            }
+
+            $jsonBrandsList = json_encode($filteredBrandsList);
+
+            return "
+            <script>
+                $(document).ready(function() {
+                    var brandsList = $jsonBrandsList;
+                    var explicitBrandId = $explicitBrandId;
+                    console.log('Domain Brand Dropdown Initialized. Current Brand ID:', explicitBrandId);
+
+                    // Locate details table row (typically Status or Payment Method)
+                    var targetRow = $('select[name=\"status\"]').closest('tr');
+                    if (!targetRow.length) {
+                        targetRow = $('select[name=\"paymentmethod\"]').closest('tr');
+                    }
+
+                    if (targetRow.length && $('#multibrand_domain_row').length === 0) {
+                        var dropdownHtml = '<tr id=\"multibrand_domain_row\">' +
+                            '  <td class=\"fieldlabel\" style=\"font-weight: bold; width: 15%;\">Domain Brand</td>' +
+                            '  <td class=\"fieldarea\" colspan=\"3\">' +
+                            '    <select name=\"multibrand_id\" class=\"form-control select-inline\" style=\"min-width: 250px; font-weight: bold; padding: 4px;\">' +
+                            '      <option value=\"0\"' + (explicitBrandId === 0 ? ' selected' : '') + '>None (No Brand)</option>';
+
+                        $.each(brandsList, function(index, brand) {
+                            var selected = (brand.id === explicitBrandId) ? ' selected' : '';
+                            dropdownHtml += '      <option value=\"' + brand.id + '\"' + selected + ' style=\"color: ' + brand.color + '; font-weight: bold;\">' + brand.name + '</option>';
+                        });
+
+                        dropdownHtml += '    </select>' +
+                            '    <span style=\"margin-left: 10px; font-size: 0.9em; color: #666;\">(Select explicit brand or select None)</span>' +
+                            '  </td>' +
+                            '</tr>';
+
+                        targetRow.after(dropdownHtml);
+                        console.log('Domain Brand dropdown injected into page');
+                    }
+
+                    function syncBrandValue() {
+                        var selectedVal = $('select[name=\"multibrand_id\"]').val();
+                        if (selectedVal === undefined || selectedVal === null) {
+                            selectedVal = explicitBrandId.toString();
+                        }
+                        
+                        $('form').each(function() {
+                            var form = $(this);
+                            form.find('input[type=\"hidden\"][name=\"multibrand_id\"]').remove();
+                            form.append('<input type=\"hidden\" name=\"multibrand_id\" value=\"' + selectedVal + '\">');
+                        });
+                        console.log('syncBrandValue: Updated hidden input in all forms with value:', selectedVal);
+                    }
+
+                    syncBrandValue();
+                    $(document).on('change', 'select[name=\"multibrand_id\"]', function() {
+                        console.log('Domain brand dropdown changed to:', $(this).val());
+                        syncBrandValue();
+                    });
+                    
+                    $('form').on('submit', function(e) {
+                        console.log('Form submitted, syncing domain brand value');
+                        syncBrandValue();
+                        return true;
+                    });
+                    
+                    $(document).on('click', 'input[type=\"submit\"], button[type=\"submit\"], .btn-primary, .btn', function(e) {
+                        console.log('Submit button clicked, syncing domain brand value');
+                        syncBrandValue();
+                    });
+                });
+            </script>
+            ";
+        }
+
         // -- Service Edit Page --
         if ($filename == 'clientsservices') {
             $serviceId = (int)($_REQUEST['id'] ?? 0);
@@ -4515,6 +6445,134 @@ add_hook('AdminAreaFooterOutput', 2, function ($vars) {
                     
                     $(document).on('click', 'input[type=\"submit\"], button[type=\"submit\"], .btn-primary, .btn', function(e) {
                         console.log('Submit button clicked, syncing service brand value');
+                        syncBrandValue();
+                    });
+                });
+            </script>
+            ";
+        }
+
+        // -- Addon Edit Page --
+        if ($filename == 'clientsaddonslist' && $action == 'edit') {
+            $addonId = (int)($_REQUEST['id'] ?? 0);
+            $explicitBrandId = 0;
+            $clientId = 0;
+            if ($addonId > 0) {
+                $explicitAddonBrand = Capsule::table('mod_multibrand_addon_brands')
+                    ->where('addon_id', $addonId)
+                    ->first();
+                if ($explicitAddonBrand) {
+                    $explicitBrandId = $explicitAddonBrand->brand_id;
+                }
+                try {
+                    $addon = Capsule::table('tblhostingaddons')->where('id', $addonId)->first();
+                    if ($addon) {
+                        $clientId = (int)$addon->userid;
+                        if ($explicitBrandId === 0) {
+                            $parentServiceBrand = Capsule::table('mod_multibrand_service_brands')
+                                ->where('service_id', (int)$addon->hostingid)
+                                ->first();
+                            if ($parentServiceBrand) {
+                                $explicitBrandId = $parentServiceBrand->brand_id;
+                            }
+                        }
+                    }
+                } catch (\Exception $e) {}
+            }
+
+            if ($clientId === 0) {
+                $clientId = (int)($_REQUEST['userid'] ?? $_REQUEST['id'] ?? 0);
+            }
+
+            $assignedBrandIds = [];
+            if ($clientId > 0) {
+                try {
+                    $assignedBrandIds = Capsule::table('mod_multibrand_client_brands')
+                        ->where('client_id', $clientId)
+                        ->pluck('brand_id')
+                        ->toArray();
+                } catch (\Exception $e) {}
+            }
+
+            $filteredBrandsList = [];
+            if (!empty($assignedBrandIds)) {
+                foreach ($brandsList as $brand) {
+                    if (in_array($brand['id'], $assignedBrandIds)) {
+                        $filteredBrandsList[] = $brand;
+                    }
+                }
+            }
+            if (empty($filteredBrandsList)) {
+                $filteredBrandsList = $brandsList;
+            }
+
+            $jsonBrandsList = json_encode($filteredBrandsList);
+
+            return "
+            <script>
+                $(document).ready(function() {
+                    var brandsList = $jsonBrandsList;
+                    var explicitBrandId = $explicitBrandId;
+                    console.log('Addon Brand Dropdown Initialized. Current Brand ID:', explicitBrandId);
+
+                    // Locate details table row (typically Billing Cycle, Status, or Payment Method)
+                    var paymentRow = $('select[name=\"paymentmethod\"]').closest('tr');
+                    if (!paymentRow.length) {
+                        paymentRow = $('select[name=\"status\"]').closest('tr');
+                    }
+                    if (!paymentRow.length) {
+                        paymentRow = $('select[name=\"addonid\"]').closest('tr');
+                    }
+
+                    if (paymentRow.length && $('#multibrand_addon_row').length === 0) {
+                        var dropdownHtml = '<tr id=\"multibrand_addon_row\">' +
+                            '  <td class=\"fieldlabel\" style=\"font-weight: bold; width: 15%;\">Addon Brand</td>' +
+                            '  <td class=\"fieldarea\">' +
+                            '    <select name=\"multibrand_id\" class=\"form-control select-inline\" style=\"min-width: 250px; font-weight: bold; padding: 4px;\">' +
+                            '      <option value=\"0\"' + (explicitBrandId === 0 ? ' selected' : '') + '>None (No Brand)</option>';
+
+                        $.each(brandsList, function(index, brand) {
+                            var selected = (brand.id === explicitBrandId) ? ' selected' : '';
+                            dropdownHtml += '      <option value=\"' + brand.id + '\"' + selected + ' style=\"color: ' + brand.color + '; font-weight: bold;\">' + brand.name + '</option>';
+                        });
+
+                        dropdownHtml += '    </select>' +
+                            '    <span style=\"margin-left: 10px; font-size: 0.9em; color: #666;\">(Select explicit brand or select None)</span>' +
+                            '  </td>' +
+                            '</tr>';
+
+                        paymentRow.after(dropdownHtml);
+                        console.log('Addon Brand dropdown injected into page');
+                    }
+
+                    function syncBrandValue() {
+                        var selectedVal = $('select[name=\"multibrand_id\"]').val();
+                        if (selectedVal === undefined || selectedVal === null) {
+                            selectedVal = explicitBrandId.toString();
+                        }
+                        
+                        $('form').each(function() {
+                            var form = $(this);
+                            form.find('input[type=\"hidden\"][name=\"multibrand_id\"]').remove();
+                            form.append('<input type=\"hidden\" name=\"multibrand_id\" value=\"' + selectedVal + '\">');
+                        });
+                        console.log('syncBrandValue: Updated hidden input in all forms with value:', selectedVal);
+                    }
+
+                    syncBrandValue();
+                    $(document).on('change', 'select[name=\"multibrand_id\"]', function() {
+                        console.log('Addon brand dropdown changed to:', $(this).val());
+                        syncBrandValue();
+                    });
+                    
+                    $('form').on('submit', function(e) {
+                        console.log('Form submitted, syncing addon brand value');
+                        syncBrandValue();
+                        return true;
+                    });
+                    
+                    $(document).on('click', 'input[type=\"submit\"], button[type=\"submit\"], .btn-primary, .btn', function(e) {
+                        console.log('Submit button clicked, syncing addon brand value');
                         syncBrandValue();
                     });
                 });
@@ -5338,6 +7396,38 @@ add_hook('AdminAreaFooterOutput', 2, function ($vars) {
             }
         } catch (\Exception $e) {}
 
+        // Fetch addon brands map
+        $addonBrandMap = [];
+        try {
+            $allAddons = Capsule::table('tblhostingaddons')
+                ->Join('mod_multibrand_addon_brands', 'tblhostingaddons.id', '=', 'mod_multibrand_addon_brands.addon_id')
+                ->leftJoin('mod_multibrand_service_brands', 'tblhostingaddons.hostingid', '=', 'mod_multibrand_service_brands.service_id')
+                ->select(
+                    'tblhostingaddons.id',
+                    'mod_multibrand_addon_brands.brand_id as addon_template_brand_id',
+                    'mod_multibrand_service_brands.brand_id as parent_service_brand_id'
+                )
+                ->get();
+            
+            foreach ($allAddons as $addon) {
+                $brandId = $addon->addon_template_brand_id ?: $addon->parent_service_brand_id;
+                if ($brandId && isset($brandMap[$brandId])) {
+                    $addonBrandMap[$addon->id] = $brandMap[$brandId];
+                }
+            }
+        } catch (\Exception $e) {}
+
+        // Fetch domain brands map
+        $domainBrandMap = [];
+        try {
+            $domainBrands = Capsule::table('mod_multibrand_domain_brands')->get();
+            foreach ($domainBrands as $db) {
+                if (isset($brandMap[$db->brand_id])) {
+                    $domainBrandMap[$db->domain_id] = $brandMap[$db->brand_id];
+                }
+            }
+        } catch (\Exception $e) {}
+
         $jsonBrandsList = json_encode($brandsList);
         $jsonClientBrandMap = json_encode($clientBrandMap);
         $jsonInvoiceBrandMap = json_encode($invoiceBrandMap);
@@ -5346,6 +7436,8 @@ add_hook('AdminAreaFooterOutput', 2, function ($vars) {
         $jsonOrderBrandMap = json_encode($orderBrandMap);
         $jsonServiceBrandMap = json_encode($serviceBrandMap);
         $jsonTicketBrandMap = json_encode($ticketBrandMap);
+        $jsonAddonBrandMap = json_encode($addonBrandMap);
+        $jsonDomainBrandMap = json_encode($domainBrandMap);
     // print_r($filename);die();
         return "
         <script>
@@ -5358,10 +7450,22 @@ add_hook('AdminAreaFooterOutput', 2, function ($vars) {
                 var orderBrands = $jsonOrderBrandMap;
                 var serviceBrands = $jsonServiceBrandMap;
                 var ticketBrands = $jsonTicketBrandMap;
+                var addonBrands = $jsonAddonBrandMap;
+                var domainBrands = $jsonDomainBrandMap;
                 var filename = '$filename';
+                var isDomainEditPage = (filename === 'clientsdomains' && window.location.pathname.indexOf('clientsdomains.php') !== -1);
 
                 function injectBrandsColumn() {
-                    var table = $('.datatable, .table').first();
+                    if (isDomainEditPage) return;
+                    var table;
+                    if (filename === 'clientsdomains' || filename === 'clientsdomainlist' || filename === 'clientsdomainslist') {
+                        // WHMCS admin domain list uses various table classes; target any table with domain rows
+                        table = $('table').filter(function() {
+                            return $(this).find('th').length > 0;
+                        }).first();
+                    } else {
+                        table = $('.datatable, .table').first();
+                    }
                     if (!table.length) return;
 
                     table.find('tr').each(function() {
@@ -5418,6 +7522,18 @@ add_hook('AdminAreaFooterOutput', 2, function ($vars) {
                                     if (svcMatch) {
                                         entityId = svcMatch[1];
                                     }
+                                } else if (filename === 'clientsaddonslist') {
+                                    var addonMatch = href.match(/clientsaddonslist\\.php\\?(?:.*\u0026)?id=(\d+)/);
+                                    if (addonMatch) {
+                                        entityId = addonMatch[1];
+                                    }
+                                } else if (filename === 'clientsdomains' || filename === 'clientsdomainlist' || filename === 'clientsdomainslist') {
+                                    var domainMatch = href.match(/clientsdomains\\.php\\?(?:.*\u0026)?id=(\d+)/) ||
+                                                      href.match(/\/admin\/domains\/[^/]+\/(\d+)/) ||
+                                                      href.match(/[?&]id=(\d+)/);
+                                    if (domainMatch) {
+                                        entityId = domainMatch[1];
+                                    }
                                 }
                             });
 
@@ -5442,6 +7558,28 @@ add_hook('AdminAreaFooterOutput', 2, function ($vars) {
                                 var idText = row.find('td:nth-child(2)').text().trim();
                                 if (idText && !isNaN(parseInt(idText))) {
                                     entityId = parseInt(idText);
+                                }
+                            }
+
+                            if (filename === 'clientsaddonslist' && !entityId) {
+                                var idText = row.find('td:nth-child(2)').text().trim();
+                                if (idText && !isNaN(parseInt(idText))) {
+                                    entityId = parseInt(idText);
+                                }
+                            }
+
+                            if ((filename === 'clientsdomains' || filename === 'clientsdomainlist' || filename === 'clientsdomainslist') && !entityId) {
+                                // Try to find domain ID from checkbox value (common in WHMCS domain list)
+                                var domainCb = row.find('input[type=checkbox]');
+                                if (domainCb.length && domainCb.val() && !isNaN(parseInt(domainCb.val()))) {
+                                    entityId = parseInt(domainCb.val());
+                                }
+                                // Fallback: first numeric cell (ID column)
+                                if (!entityId) {
+                                    var idText = row.find('td:first-child').text().trim();
+                                    if (idText && !isNaN(parseInt(idText))) {
+                                        entityId = parseInt(idText);
+                                    }
                                 }
                             }
 
@@ -5477,6 +7615,16 @@ add_hook('AdminAreaFooterOutput', 2, function ($vars) {
                             } else if (filename === 'clientshostinglist' || filename === 'clientsservices') {
                                 if (entityId && serviceBrands[entityId]) {
                                     var brand = serviceBrands[entityId];
+                                    badgesHtml = '<div style=\"margin-bottom: 3px;\"><span class=\"label\" style=\"background-color:' + brand.color + '; color: #fff; font-size: 0.85em; padding: 2px 6px; border-radius: 3px; display: inline-block; font-weight: bold; text-transform: uppercase;\">' + brand.name + '</span></div>';
+                                }
+                            } else if (filename === 'clientsaddonslist') {
+                                if (entityId && addonBrands[entityId]) {
+                                    var brand = addonBrands[entityId];
+                                    badgesHtml = '<div style=\"margin-bottom: 3px;\"><span class=\"label\" style=\"background-color:' + brand.color + '; color: #fff; font-size: 0.85em; padding: 2px 6px; border-radius: 3px; display: inline-block; font-weight: bold; text-transform: uppercase;\">' + brand.name + '</span></div>';
+                                }
+                            } else if (filename === 'clientsdomains' || filename === 'clientsdomainlist' || filename === 'clientsdomainslist') {
+                                if (entityId && domainBrands[entityId]) {
+                                    var brand = domainBrands[entityId];
                                     badgesHtml = '<div style=\"margin-bottom: 3px;\"><span class=\"label\" style=\"background-color:' + brand.color + '; color: #fff; font-size: 0.85em; padding: 2px 6px; border-radius: 3px; display: inline-block; font-weight: bold; text-transform: uppercase;\">' + brand.name + '</span></div>';
                                 }
                             } else if (filename === 'supportannouncements') {
@@ -5893,6 +8041,59 @@ add_hook('InvoiceCreated', 1, function ($vars) {
                 }
             } catch (\Exception $ex) {}
         }
+
+        // 5. Override Domain Renewal invoice items with brand-wise pricing
+        $invoiceItems = Capsule::table('tblinvoiceitems')->where('invoiceid', $invoiceId)->where('type', 'Domain')->get();
+        $invoiceUpdated = false;
+        foreach ($invoiceItems as $item) {
+            if (stripos($item->description, 'Renewal') !== false && $item->relid > 0) {
+                $domain = Capsule::table('tbldomains')->find($item->relid);
+                if ($domain) {
+                    $domainName = $domain->domain;
+                    $dotPos = strpos($domainName, '.');
+                    if ($dotPos !== false) {
+                        $tld = substr($domainName, $dotPos);
+                        $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $tld)->first();
+                        if ($domainTemplate) {
+                            $clientBrand = Capsule::table('mod_multibrand_client_brands')->where('client_id', $domain->userid)->first();
+                            $brandObj = null;
+                            if ($clientBrand) {
+                                $brandObj = Capsule::table('mod_multibrand_brands')->find($clientBrand->brand_id);
+                            }
+                            if ($brandObj && $brandObj->price_override) {
+                                $pricingOverrides = json_decode($brandObj->pricing_overrides ?? '', true) ?: [];
+                                $invoiceRec = Capsule::table('tblinvoices')->find($invoiceId);
+                                $currencyId = $invoiceRec->currency ?: Capsule::table('tblclients')->where('id', $invoiceRec->userid)->value('currency') ?: 1;
+                                $rates = $pricingOverrides['domains'][$domainTemplate->id]['pricing'][$currencyId] ?? [];
+
+                                $regperiod = 1;
+                                if (preg_match('/(\d+)\s*Year/i', $item->description, $matches)) {
+                                    $regperiod = (int)$matches[1];
+                                } else {
+                                    $regperiod = (int)$domain->registrationperiod ?: 1;
+                                }
+
+                                $renewKey = 'renew' . $regperiod;
+                                if (isset($rates[$renewKey]) && $rates[$renewKey] !== '' && (float)$rates[$renewKey] >= 0) {
+                                    $newPrice = (float)$rates[$renewKey];
+                                    if ($newPrice != (float)$item->amount) {
+                                        Capsule::table('tblinvoiceitems')->where('id', $item->id)->update(['amount' => $newPrice]);
+                                        $invoiceUpdated = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($invoiceUpdated) {
+            if (!function_exists('updateInvoiceTotal')) {
+                require_once __DIR__ . '/../../../includes/invoicefunctions.php';
+            }
+            updateInvoiceTotal($invoiceId);
+        }
     } catch (\Exception $e) {
         // Ignore gracefully
     }
@@ -6045,6 +8246,34 @@ add_hook('AfterShoppingCartCheckout', 1, function ($vars) {
                     if (!$serviceExists) {
                         Capsule::table('mod_multibrand_service_brands')->insert([
                             'service_id' => $service->id,
+                            'brand_id' => $brandId,
+                            'created_at' => date('Y-m-d H:i:s'),
+                            'updated_at' => date('Y-m-d H:i:s')
+                        ]);
+                    }
+                }
+
+                // Save addon brand for each addon in the order
+                $addons = Capsule::table('tblhostingaddons')->where('orderid', $orderId)->get();
+                foreach ($addons as $addon) {
+                    $addonExists = Capsule::table('mod_multibrand_addon_brands')->where('addon_id', $addon->id)->exists();
+                    if (!$addonExists) {
+                        Capsule::table('mod_multibrand_addon_brands')->insert([
+                            'addon_id' => $addon->id,
+                            'brand_id' => $brandId,
+                            'created_at' => date('Y-m-d H:i:s'),
+                            'updated_at' => date('Y-m-d H:i:s')
+                        ]);
+                    }
+                }
+
+                // Save domain brand for each domain in the order
+                $domains = Capsule::table('tbldomains')->where('orderid', $orderId)->get();
+                foreach ($domains as $domain) {
+                    $domainExists = Capsule::table('mod_multibrand_domain_brands')->where('domain_id', $domain->id)->exists();
+                    if (!$domainExists) {
+                        Capsule::table('mod_multibrand_domain_brands')->insert([
+                            'domain_id' => $domain->id,
                             'brand_id' => $brandId,
                             'created_at' => date('Y-m-d H:i:s'),
                             'updated_at' => date('Y-m-d H:i:s')
@@ -6323,40 +8552,94 @@ add_hook('OrderAddonPricingOverride', 1, function ($vars) {
  */
 add_hook('OrderDomainPricingOverride', 1, function ($vars) {
     $brand = get_multibrand_active_brand();
+    
+    $debugLog = [];
+    $debugLog[] = "=== OrderDomainPricingOverride ===";
+    $debugLog[] = "Time: " . date('Y-m-d H:i:s');
+    $debugLog[] = "vars: " . json_encode($vars);
+    $debugLog[] = "Brand: " . ($brand ? $brand->brand_name . " (ID:{$brand->id})" : 'NULL');
+    $debugLog[] = "price_override: " . ($brand ? ($brand->price_override ? 'YES' : 'NO') : 'N/A');
+    $debugLog[] = "Session currency: " . ($_SESSION['currency'] ?? 'not set');
+    
     if (!$brand || !$brand->price_override) {
+        $debugLog[] = "RETURNING: No brand or price_override disabled";
+        file_put_contents(__DIR__ . '/domain_pricing_debug.log', implode("\n", $debugLog) . "\n\n", FILE_APPEND);
         return;
     }
 
     try {
         $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
-        $sld = $vars['sld'];
-        $tld = $vars['tld'];
-        $regperiod = (int)$vars['regperiod'];
+        $sld = $vars['sld'] ?? '';
+        $tld = $vars['tld'] ?? '';
+        $domainName = $vars['domain'] ?? '';
+        
+        if (empty($tld) && !empty($domainName) && strpos($domainName, '.') !== false) {
+            $dotPos = strpos($domainName, '.');
+            $sld = substr($domainName, 0, $dotPos);
+            $tld = substr($domainName, $dotPos);
+        }
+        
+        $regperiod = (int)($vars['regperiod'] ?? $vars['renewalperiod'] ?? 1);
+        
+        $debugLog[] = "Parsed domain: SLD=$sld, TLD=$tld, regperiod=$regperiod";
+        $debugLog[] = "pricing_overrides domains: " . json_encode(array_keys($pricingOverrides['domains'] ?? []));
         
         $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $tld)->first();
         if ($domainTemplate) {
             $domainId = $domainTemplate->id;
             $domainOverrides = $pricingOverrides['domains'][$domainId]['pricing'] ?? [];
+            $debugLog[] = "Domain template found: ID=$domainId, domainOverrides keys: " . json_encode(array_keys($domainOverrides));
             
             if (!empty($domainOverrides)) {
                 $currencyId = (int)($_SESSION['currency'] ?? 1);
                 $rates = $domainOverrides[$currencyId] ?? [];
+                $debugLog[] = "Currency: $currencyId, rates: " . json_encode($rates);
+                
                 if (!empty($rates)) {
                     $regPriceKey = 'register' . $regperiod;
                     $transPriceKey = 'transfer' . $regperiod;
                     $renewPriceKey = 'renew' . $regperiod;
                     
-                    if (isset($rates[$regPriceKey]) && $rates[$regPriceKey] !== '') {
-                        return [
-                            'register' => $rates[$regPriceKey],
-                            'transfer' => $rates[$transPriceKey] !== '' ? $rates[$transPriceKey] : '0.00',
-                            'renew'    => $rates[$renewPriceKey] !== '' ? $rates[$renewPriceKey] : '0.00',
-                        ];
+                    $regPrice = isset($rates[$regPriceKey]) && $rates[$regPriceKey] !== '' && (float)$rates[$regPriceKey] >= 0 ? (float)$rates[$regPriceKey] : null;
+                    $transPrice = isset($rates[$transPriceKey]) && $rates[$transPriceKey] !== '' && (float)$rates[$transPriceKey] >= 0 ? (float)$rates[$transPriceKey] : null;
+                    $renewPrice = isset($rates[$renewPriceKey]) && $rates[$renewPriceKey] !== '' && (float)$rates[$renewPriceKey] >= 0 ? (float)$rates[$renewPriceKey] : null;
+                    
+                    $debugLog[] = "Rates check: reg=$regPrice, trans=$transPrice, renew=$renewPrice";
+                    
+                    $type = $vars['type'] ?? 'register';
+                    $result = [];
+                    if ($type == 'register' && $regPrice !== null) {
+                        $result['firstPaymentAmount'] = $regPrice;
+                    } elseif ($type == 'transfer' && $transPrice !== null) {
+                        $result['firstPaymentAmount'] = $transPrice;
+                    } elseif ($type == 'renew' && $renewPrice !== null) {
+                        $result['firstPaymentAmount'] = $renewPrice;
+                    }
+                    
+                    if ($renewPrice !== null) {
+                        $result['recurringAmount'] = $renewPrice;
+                    }
+                    
+                    if (!empty($result)) {
+                        $debugLog[] = "RETURNING OVERRIDE: " . json_encode($result);
+                        file_put_contents(__DIR__ . '/domain_pricing_debug.log', implode("\n", $debugLog) . "\n\n", FILE_APPEND);
+                        return $result;
+                    } else {
+                        $debugLog[] = "No overrides applied (prices not found or disabled)";
                     }
                 }
+            } else {
+                $debugLog[] = "No domain overrides found for domain ID $domainId";
             }
+        } else {
+            $debugLog[] = "Domain template NOT found for TLD: $tld";
         }
-    } catch (\Exception $e) {}
+    } catch (\Exception $e) {
+        $debugLog[] = "Exception: " . $e->getMessage();
+    }
+    
+    $debugLog[] = "RETURNING: No override applied";
+    file_put_contents(__DIR__ . '/domain_pricing_debug.log', implode("\n", $debugLog) . "\n\n", FILE_APPEND);
 });
 
 /**
@@ -6622,6 +8905,36 @@ function apply_brand_gateway_overrides($brand)
 }
 }
 
+/**
+ * Hook to associate a newly added addon with the parent service's brand or the active brand.
+ */
+add_hook('AddonAdd', 1, function ($vars) {
+    // Addon instances are not stored in mod_multibrand_addon_brands (which relates to tbladdons).
+    // They inherit the brand of their parent service or their template, so no table insert is needed here.
+});
+
+/**
+ * Hook to save brand assignment when an addon is edited in the admin area
+ */
+add_hook('AddonEdit', 1, function ($vars) {
+    $addonId = (int)$vars['id'];
+    if (isset($_POST['multibrand_id'])) {
+        $brandId = (int)$_POST['multibrand_id'];
+        try {
+            if ($brandId === 0) {
+                Capsule::table('mod_multibrand_addon_brands')
+                    ->where('addon_id', $addonId)
+                    ->delete();
+            } else {
+                Capsule::table('mod_multibrand_addon_brands')->updateOrInsert(
+                    ['addon_id' => $addonId],
+                    ['brand_id' => $brandId, 'updated_at' => date('Y-m-d H:i:s')]
+                );
+            }
+        } catch (\Exception $e) {}
+    }
+});
+
 // Runtime Execution on Frontend
 if (!defined('ADMIN_AREA')) {
     try {
@@ -6670,4 +8983,130 @@ function getalldataofbrand(){
 }
 getalldataofbrand();
 
+add_hook('AfterCalculateCartTotals', 1, function ($vars) {
+    try {
+        $brand = get_multibrand_active_brand();
+        if (!$brand || !$brand->price_override) {
+            return;
+        }
 
+        $pricingOverrides = json_decode($brand->pricing_overrides ?? '', true) ?: [];
+        if (empty($pricingOverrides['domains'])) {
+            return;
+        }
+
+        $currencyId = isset($vars['activeCurrency']) && is_object($vars['activeCurrency']) ? (int)$vars['activeCurrency']->id : (int)($_SESSION['currency'] ?? 0);
+        if ($currencyId <= 0) {
+            $currencyId = (int)Capsule::table('tblcurrencies')->where('default', 1)->value('id') ?: 1;
+        }
+
+        $changed = false;
+        $diff = 0.0;
+
+        // Mutate Price object helper
+        $mutatePrice = function ($priceObj, $newAmount) {
+            if (!is_object($priceObj) || get_class($priceObj) !== 'WHMCS\View\Formatter\Price') return;
+            try {
+                $ref = new \ReflectionClass($priceObj);
+                $prop = $ref->getProperty('price');
+                $prop->setAccessible(true);
+                $prop->setValue($priceObj, (float)$newAmount);
+            } catch (\Exception $e) {}
+        };
+
+        // Process domains renewals
+        if (isset($vars['renewalsByType']['domains']) && is_array($vars['renewalsByType']['domains'])) {
+            foreach ($vars['renewalsByType']['domains'] as $domainId => $renewal) {
+                $domainName = '';
+                if (is_array($renewal)) {
+                    $domainName = $renewal['domain'] ?? '';
+                } elseif (is_object($renewal)) {
+                    $domainName = $renewal->domain ?? '';
+                }
+
+                if (!$domainName || strpos($domainName, '.') === false) continue;
+
+                $dotPos = strpos($domainName, '.');
+                $tld = substr($domainName, $dotPos);
+                $domainTemplate = Capsule::table('tbldomainpricing')->where('extension', $tld)->first();
+                if (!$domainTemplate) continue;
+
+                $domainIdDb = $domainTemplate->id;
+                $domainOverrides = $pricingOverrides['domains'][$domainIdDb]['pricing'] ?? [];
+                if (empty($domainOverrides)) continue;
+
+                $rates = $domainOverrides[$currencyId] ?? [];
+                if (empty($rates)) continue;
+
+                $regperiod = 1;
+                if (is_array($renewal)) {
+                    $regperiod = (int)($renewal['regperiod'] ?? 1);
+                } elseif (is_object($renewal)) {
+                    $regperiod = (int)($renewal->regperiod ?? 1);
+                }
+
+                $renewKey = 'renew' . $regperiod;
+                if (isset($rates[$renewKey]) && $rates[$renewKey] !== '' && (float)$rates[$renewKey] >= 0) {
+                    $newPrice = (float)$rates[$renewKey];
+
+                    $oldPrice = 0.0;
+                    $priceObj = null;
+                    if (is_array($renewal)) {
+                        $priceObj = $renewal['priceBeforeTax'] ?? null;
+                    } elseif (is_object($renewal)) {
+                        $priceObj = $renewal->priceBeforeTax ?? null;
+                    }
+
+                    if ($priceObj && is_object($priceObj) && method_exists($priceObj, 'toNumeric')) {
+                        $oldPrice = (float)$priceObj->toNumeric();
+                    }
+
+                    if ($newPrice != $oldPrice) {
+                        $diff += ($newPrice - $oldPrice);
+                        $changed = true;
+
+                        // Mutate the priceBeforeTax object directly!
+                        $mutatePrice($priceObj, $newPrice);
+
+                        // Also mutate the main price object if present
+                        $priceObjMain = is_array($renewal) ? ($renewal['price'] ?? null) : ($renewal->price ?? null);
+                        if ($priceObjMain) {
+                            $mutatePrice($priceObjMain, $newPrice);
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($changed && $diff != 0) {
+            // Mutate subtotal Price object
+            if (isset($vars['subtotal']) && is_object($vars['subtotal'])) {
+                $subtotalVal = (float)$vars['subtotal']->toNumeric() + $diff;
+                $mutatePrice($vars['subtotal'], $subtotalVal);
+            }
+
+            // Recalculate tax and total if tax is set
+            $taxrate = isset($vars['taxrate']) ? (float)$vars['taxrate'] : 0.0;
+            $taxrate2 = isset($vars['taxrate2']) ? (float)$vars['taxrate2'] : 0.0;
+
+            if ($taxrate > 0 && isset($vars['taxtotal']) && is_object($vars['taxtotal'])) {
+                $subtotalVal = isset($vars['subtotal']) ? (float)$vars['subtotal']->toNumeric() : 0.0;
+                $taxtotal = round($subtotalVal * ($taxrate / 100), 2);
+                $mutatePrice($vars['taxtotal'], $taxtotal);
+            }
+            if ($taxrate2 > 0 && isset($vars['taxtotal2']) && is_object($vars['taxtotal2'])) {
+                $subtotalVal = isset($vars['subtotal']) ? (float)$vars['subtotal']->toNumeric() : 0.0;
+                $taxtotal2 = round($subtotalVal * ($taxrate2 / 100), 2);
+                $mutatePrice($vars['taxtotal2'], $taxtotal2);
+            }
+
+            if (isset($vars['total']) && is_object($vars['total'])) {
+                $subtotalVal = isset($vars['subtotal']) ? (float)$vars['subtotal']->toNumeric() : 0.0;
+                $taxtotal = isset($vars['taxtotal']) ? (float)$vars['taxtotal']->toNumeric() : 0.0;
+                $taxtotal2 = isset($vars['taxtotal2']) ? (float)$vars['taxtotal2']->toNumeric() : 0.0;
+                $totalVal = $subtotalVal + $taxtotal + $taxtotal2;
+                $mutatePrice($vars['total'], $totalVal);
+            }
+        }
+    } catch (\Exception $e) {}
+});

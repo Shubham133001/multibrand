@@ -208,6 +208,26 @@ function multibrand_activate()
             });
         }
 
+        // Create table for addon-brand association if needed
+        if (!Capsule::schema()->hasTable('mod_multibrand_addon_brands')) {
+            Capsule::schema()->create('mod_multibrand_addon_brands', function ($table) {
+                $table->increments('id');
+                $table->integer('addon_id')->unique();
+                $table->integer('brand_id');
+                $table->timestamps();
+            });
+        }
+
+        // Create table for domain-brand association if needed
+        if (!Capsule::schema()->hasTable('mod_multibrand_domain_brands')) {
+            Capsule::schema()->create('mod_multibrand_domain_brands', function ($table) {
+                $table->increments('id');
+                $table->integer('domain_id')->unique();
+                $table->integer('brand_id');
+                $table->timestamps();
+            });
+        }
+
         // Create table for ticket-brand association if needed
         if (!Capsule::schema()->hasTable('mod_multibrand_ticket_brands')) {
             Capsule::schema()->create('mod_multibrand_ticket_brands', function ($table) {
@@ -217,6 +237,16 @@ function multibrand_activate()
                 $table->timestamps();
             });
         }
+
+         // Create table for mod_multibrand_quote_brands 
+            if (!Capsule::schema()->hasTable('mod_multibrand_quote_brands')) {
+                Capsule::schema()->create('mod_multibrand_quote_brands', function ($table) {
+                    $table->increments('id');
+                    $table->integer('quote_id')->unique();
+                    $table->integer('brand_id');
+                    $table->timestamps();
+                });
+            }
 
         // Insert default brand if table is empty
         try {
@@ -280,6 +310,9 @@ function multibrand_deactivate()
         // Capsule::schema()->dropIfExists('mod_multibrand_order_brands');
         // Capsule::schema()->dropIfExists('mod_multibrand_service_brands');
         // Capsule::schema()->dropIfExists('mod_multibrand_ticket_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_domain_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_addon_brands');
+        // Capsule::schema()->dropIfExists('mod_multibrand_quote_brands');
         return array("status" => "success", "description" => "Multi Brand module deactivated successfully");
     } catch (Exception $e) {
         return array("status" => "error", "description" => "Failed to deactivate: " . $e->getMessage());
